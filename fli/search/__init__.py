@@ -1,8 +1,10 @@
 from .dates import DatePrice, SearchDates
+from .explore import SearchExplore
 from .flights import SearchFlights
 
 __all__ = [
-    "SearchFlights",
-    "SearchDates",
     "DatePrice",
+    "SearchDates",
+    "SearchExplore",
+    "SearchFlights",
 ]

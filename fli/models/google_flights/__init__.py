@@ -14,6 +14,12 @@ from .base import (
     TripType,
 )
 from .dates import DateSearchFilters
+from .explore import (
+    ExploreDestination,
+    ExploreLocation,
+    ExploreLocationType,
+    ExploreSearchFilters,
+)
 from .flights import FlightSearchFilters
 
 __all__ = [
@@ -22,6 +28,10 @@ __all__ = [
     "BagsFilter",
     "DateSearchFilters",
     "EmissionsFilter",
+    "ExploreDestination",
+    "ExploreLocation",
+    "ExploreLocationType",
+    "ExploreSearchFilters",
     "FlightLeg",
     "FlightResult",
     "FlightSearchFilters",
