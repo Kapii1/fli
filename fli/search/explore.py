@@ -57,11 +57,11 @@ class SearchExplore:
                 url=self.BASE_URL,
                 data=f"f.req={filters.encode()}",
                 impersonate="chrome",
-                allow_redirects=True,
+                allow_redirects=False,
             )
             response.raise_for_status()
 
-            envelope = json.loads(response.text.lstrip(")]}'"))
+            envelope = json.loads(response.content.lstrip(b")]}'"))
             wrb_entries = [
                 row for row in envelope if isinstance(row, list) and row and row[0] == "wrb.fr"
             ]
@@ -86,7 +86,7 @@ class SearchExplore:
                             if existing is None:
                                 seen[parsed.kg_id] = parsed
                             elif parsed.price is not None and existing.price is None:
-                                seen[parsed.kg_id] = existing.model_copy(update={"price": parsed.price})
+                                existing.price = parsed.price
 
             destinations = list(seen.values())
 

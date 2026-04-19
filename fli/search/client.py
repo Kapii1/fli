@@ -23,11 +23,25 @@ class Client:
     DEFAULT_HEADERS = {
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
+    # Google throttles cold sessions with ~22 s delayed responses; a tight
+    # per-request timeout lets tenacity retry fast instead of hanging.
+    REQUEST_TIMEOUT = 10
 
     def __init__(self):
         """Initialize a new client session with default headers."""
-        self._client = requests.Session()
+        # Set impersonate at session level so curl pools connections with a
+        # consistent JA3 fingerprint across all requests (per-call impersonate
+        # can break keep-alive reuse).
+        self._client = requests.Session(impersonate="chrome")
         self._client.headers.update(self.DEFAULT_HEADERS)
+        try:
+            self._client.head(
+                "https://www.google.com/travel/flights",
+                timeout=5,
+                allow_redirects=False,
+            )
+        except Exception:
+            pass
 
     def __del__(self):
         """Clean up client session on deletion."""
@@ -36,7 +50,7 @@ class Client:
 
     @sleep_and_retry
     @limits(calls=10, period=1)
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=4), reraise=True)
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         """Make a rate-limited GET request with automatic retries.
 
@@ -51,6 +65,7 @@ class Client:
             Exception: If request fails after all retries
 
         """
+        kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
         try:
             response = self._client.get(url, **kwargs)
             response.raise_for_status()
@@ -60,7 +75,7 @@ class Client:
 
     @sleep_and_retry
     @limits(calls=10, period=1)
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=4), reraise=True)
     def post(self, url: str, **kwargs: Any) -> requests.Response:
         """Make a rate-limited POST request with automatic retries.
 
@@ -75,6 +90,7 @@ class Client:
             Exception: If request fails after all retries
 
         """
+        kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
         try:
             response = self._client.post(url, **kwargs)
             response.raise_for_status()

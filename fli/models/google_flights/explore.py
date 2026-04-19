@@ -80,6 +80,7 @@ class ExploreSearchFilters(BaseModel):
     latest_departure: PositiveInt | None = None
     earliest_arrival: NonNegativeInt | None = None
     latest_arrival: PositiveInt | None = None
+    viewport: tuple[tuple[float, float], tuple[float, float]] | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> "ExploreSearchFilters":
@@ -171,9 +172,14 @@ class ExploreSearchFilters(BaseModel):
         date_range = (
             [self.from_date, self.to_date] if self.from_date and self.to_date else None
         )
+        viewport = (
+            [list(self.viewport[0]), list(self.viewport[1])]
+            if self.viewport is not None
+            else None
+        )
         return [
             [],  # [0] known destinations filter (empty = any)
-            None,  # [1] map viewport [[lat_max, lng_max], [lat_min, lng_min]]
+            viewport,  # [1] map viewport [[lat_max, lng_max], [lat_min, lng_min]]
             date_range,  # [2] date range [from, to] or null
             self._filter_block(),  # [3] flight filters
             # [4] desired trip length; scalar integers 400 — must be a [min, max]

@@ -1,6 +1,7 @@
 services:
   fli-mcp:
-    image: ghcr.io/punitarani/fli:latest
+    build:
+      context: .
     ports:
       - "8000:8000"
     environment:

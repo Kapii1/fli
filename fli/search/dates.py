@@ -120,10 +120,10 @@ class SearchDates:
                 url=self.BASE_URL,
                 data=f"f.req={encoded_filters}",
                 impersonate="chrome",
-                allow_redirects=True,
+                allow_redirects=False,
             )
             response.raise_for_status()
-            parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
+            parsed = json.loads(response.content.lstrip(b")]}'"))[0][2]
             if not parsed:
                 return None
 
