@@ -118,11 +118,21 @@ class ExploreSearchFilters(BaseModel):
         ]
 
     def _segments(self) -> list:
-        """Build the segment array (1 element for one-way, 2 for round-trip)."""
+        """Build the segment array (1 element for one-way, 2 for round-trip).
+
+        When specific dates are provided, uses 15-element segments with travel_date
+        at index [6] — required for specific-date pricing mode.
+        """
         origin = self._loc_list(self.origin)
         dest = self._loc_list(self.destination)
         time_filter = self._time_restrictions()
         stops = self.stops.value
+        if self.from_date is not None:
+            outbound = [origin, dest, time_filter, stops, None, None, self.from_date, None, None, None, None, None, None, None, 3]
+            if self.trip_type == TripType.ROUND_TRIP:
+                return_seg = [dest, origin, time_filter, stops, None, None, self.to_date, None, None, None, None, None, None, None, 3]
+                return [outbound, return_seg]
+            return [outbound]
         outbound = [origin, dest, time_filter, stops]
         if self.trip_type == TripType.ROUND_TRIP:
             return [outbound, [dest, origin, time_filter, stops]]
@@ -153,7 +163,7 @@ class ExploreSearchFilters(BaseModel):
             None,
             None,
             None,
-            0,
+            1 if self.from_date is not None else 0,
         ]
 
     def format(self) -> list:

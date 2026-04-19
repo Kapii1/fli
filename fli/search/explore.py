@@ -62,27 +62,33 @@ class SearchExplore:
             response.raise_for_status()
 
             envelope = json.loads(response.text.lstrip(")]}'"))
-            wrb = next(
-                (row for row in envelope if isinstance(row, list) and row and row[0] == "wrb.fr"),
-                None,
-            )
-            if not wrb or len(wrb) < 3 or not wrb[2]:
+            wrb_entries = [
+                row for row in envelope if isinstance(row, list) and row and row[0] == "wrb.fr"
+            ]
+            if not wrb_entries:
                 return None
 
-            inner = json.loads(wrb[2])
-            groups = inner[3] if len(inner) > 3 and isinstance(inner[3], list) else []
-
-            destinations: list[ExploreDestination] = []
-            seen: set[str] = set()
-            for group in groups:
-                if not isinstance(group, list):
+            seen: dict[str, ExploreDestination] = {}
+            for wrb in wrb_entries:
+                if len(wrb) < 3 or not wrb[2]:
                     continue
-                for record in group:
-                    parsed = self._parse_destination(record)
-                    if parsed is None or parsed.kg_id in seen:
-                        continue
-                    seen.add(parsed.kg_id)
-                    destinations.append(parsed)
+                inner = json.loads(wrb[2])
+                candidate_groups = [inner[i] for i in (3, 4) if len(inner) > i and isinstance(inner[i], list)]
+                for groups in candidate_groups:
+                    for group in groups:
+                        if not isinstance(group, list):
+                            continue
+                        for record in group:
+                            parsed = self._parse_destination(record, filters.from_date, filters.to_date)
+                            if parsed is None:
+                                continue
+                            existing = seen.get(parsed.kg_id)
+                            if existing is None:
+                                seen[parsed.kg_id] = parsed
+                            elif parsed.price is not None and existing.price is None:
+                                seen[parsed.kg_id] = existing.model_copy(update={"price": parsed.price})
+
+            destinations = list(seen.values())
 
             return destinations or None
 
@@ -90,18 +96,58 @@ class SearchExplore:
             raise Exception(f"Explore search failed: {str(e)}") from e
 
     @staticmethod
-    def _parse_destination(record: list) -> ExploreDestination | None:
-        """Convert one raw destination record (29-element list) into a model."""
-        if not isinstance(record, list) or len(record) < 16:
+    def _parse_destination(
+        record: list,
+        departure_date: str | None = None,
+        return_date: str | None = None,
+    ) -> ExploreDestination | None:
+        """Convert one raw destination record into a model.
+
+        Handles two wire formats emitted by GetExploreDestinations:
+        - Cheapest-date mode (29-element): record[1]=[lat,lon], record[2]=name,
+          record[17]=price
+        - Specific-date mode (16-element): record[1]=[[null,price],token],
+          record[6]=[..., airport, kg, name, ...]
+        """
+        if not isinstance(record, list) or len(record) < 7:
             return None
         kg_id = record[0]
-        name = record[2]
-        if not isinstance(kg_id, str) or not isinstance(name, str):
+        if not isinstance(kg_id, str):
             return None
 
-        coords = record[1] if isinstance(record[1], list) and len(record[1]) >= 2 else (None, None)
-        price = record[17] if len(record) > 17 and isinstance(record[17], int | float) else None
+        r1 = record[1]
+        # Specific-date format: record[1] is [[null, price], booking_token]
+        if isinstance(r1, list) and r1 and isinstance(r1[0], list):
+            price_block = r1[0]
+            price = price_block[1] if len(price_block) > 1 and isinstance(price_block[1], (int, float)) else None
+            dest_info = record[6] if len(record) > 6 and isinstance(record[6], list) else []
+            airport = dest_info[5] if len(dest_info) > 5 and isinstance(dest_info[5], str) else None
+            name = dest_info[7] if len(dest_info) > 7 and isinstance(dest_info[7], str) else airport
+            if not isinstance(name, str):
+                return None
+            is_domestic = record[9] if len(record) > 9 and isinstance(record[9], bool) else None
+            return ExploreDestination(
+                kg_id=kg_id,
+                name=name,
+                country=None,
+                airport=airport,
+                latitude=None,
+                longitude=None,
+                departure_date=departure_date,
+                return_date=return_date,
+                price=float(price) if price is not None else None,
+                thumbnail_url=None,
+                is_domestic=is_domestic,
+            )
 
+        # Cheapest-date format: record[1]=[lat,lon], record[2]=name
+        if len(record) < 16:
+            return None
+        name = record[2]
+        if not isinstance(name, str):
+            return None
+        coords = r1 if isinstance(r1, list) and len(r1) >= 2 else (None, None)
+        price = record[17] if len(record) > 17 and isinstance(record[17], (int, float)) else None
         return ExploreDestination(
             kg_id=kg_id,
             name=name,
