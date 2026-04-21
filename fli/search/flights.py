@@ -351,6 +351,7 @@ class SearchFlights:
 
         """
         price, currency = SearchFlights._parse_price_info(data)
+        print("___price", price)
         token = SearchFlights._parse_booking_token(data)
         booking_url = SearchFlights.build_booking_url(token, currency) if token else None
         flight = FlightResult(
