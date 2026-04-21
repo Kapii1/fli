@@ -165,6 +165,13 @@ class FlightResult(BaseModel):
     currency: str | None = None
     duration: PositiveInt  # total duration in minutes
     stops: NonNegativeInt
+    # Short-lived (~15 min) booking token — base64-encoded protobuf that
+    # Google Flights' "Select flight" button POSTs to resolve the final
+    # booking URL. Carries flight id, fare class, and currency.
+    booking_token: str | None = None
+    # Direct deep-link to Google Flights' booking page for this itinerary.
+    # Built from `booking_token` via `build_booking_url()` below.
+    booking_url: str | None = None
 
 
 class FlightSegment(BaseModel):

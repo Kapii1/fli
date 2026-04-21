@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from fli.core import extract_currency_from_price_token
 from fli.models import DateSearchFilters
 from fli.models.google_flights.base import TripType
-from fli.search.client import get_client
+from fli.search.client import get_fast_client
 
 
 class DatePrice(BaseModel):
@@ -39,7 +39,7 @@ class SearchDates:
 
     def __init__(self):
         """Initialize the search client for date-based searches."""
-        self.client = get_client()
+        self.client = get_fast_client()
 
     def search(self, filters: DateSearchFilters) -> list[DatePrice] | None:
         """Search for flight prices across a date range and search parameters.
@@ -119,7 +119,6 @@ class SearchDates:
             response = self.client.post(
                 url=self.BASE_URL,
                 data=f"f.req={encoded_filters}",
-                impersonate="chrome",
                 allow_redirects=False,
             )
             response.raise_for_status()
