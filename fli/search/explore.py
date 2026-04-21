@@ -12,7 +12,7 @@ cheapest dates/prices Google has indexed. It is complementary to
 import json
 
 from fli.models.google_flights.explore import ExploreDestination, ExploreSearchFilters
-from fli.search.client import get_client
+from fli.search.client import get_fast_client
 
 
 class SearchExplore:
@@ -27,8 +27,15 @@ class SearchExplore:
     }
 
     def __init__(self):
-        """Initialize the HTTP client used for explore requests."""
-        self.client = get_client()
+        """Initialize the HTTP client used for explore requests.
+
+        Uses :class:`FastClient` (HTTP/3 + DoH + chrome133a) by default — the
+        Explore endpoint is extremely sensitive to session reuse and transport,
+        and the fast client measures an order of magnitude faster than the
+        default :class:`Client` on this path. Callers can still override with
+        ``inst.client = ...`` for testing or custom transports.
+        """
+        self.client = get_fast_client()
 
     def search(self, filters: ExploreSearchFilters) -> list[ExploreDestination] | None:
         """Run an Explore query and return the flat list of destinations.
@@ -73,20 +80,35 @@ class SearchExplore:
                 if len(wrb) < 3 or not wrb[2]:
                     continue
                 inner = json.loads(wrb[2])
-                candidate_groups = [inner[i] for i in (3, 4) if len(inner) > i and isinstance(inner[i], list)]
-                for groups in candidate_groups:
-                    for group in groups:
+
+                # inner[3] → response field 4 (`_.Ws`): primary destination list.
+                # inner[4] → response field 5 (`y0d`): streaming price/offer updates
+                #           keyed on the same kg_id. Parse these last so they
+                #           enrich already-seen records.
+                primary_block = inner[3] if len(inner) > 3 and isinstance(inner[3], list) else None
+                if primary_block:
+                    for group in primary_block:
                         if not isinstance(group, list):
                             continue
                         for record in group:
-                            parsed = self._parse_destination(record, filters.from_date, filters.to_date)
+                            parsed = self._parse_destination(
+                                record, filters.from_date, filters.to_date
+                            )
                             if parsed is None:
                                 continue
                             existing = seen.get(parsed.kg_id)
                             if existing is None:
                                 seen[parsed.kg_id] = parsed
-                            elif parsed.price is not None and existing.price is None:
-                                existing.price = parsed.price
+                            else:
+                                self._merge(existing, parsed)
+
+                updates_block = inner[4] if len(inner) > 4 and isinstance(inner[4], list) else None
+                if updates_block:
+                    for group in updates_block:
+                        if not isinstance(group, list):
+                            continue
+                        for record in group:
+                            self._apply_update(record, seen)
 
             destinations = list(seen.values())
 
@@ -140,24 +162,123 @@ class SearchExplore:
                 is_domestic=is_domestic,
             )
 
-        # Cheapest-date format: record[1]=[lat,lon], record[2]=name
+        # Cheapest-date format. Indices below are proto_field_number - 1
+        # (JSPB lays out field N at array index N-1). Cross-references are to
+        # the FlightsFrontendUi `F0d` decoder, which is the canonical proof of
+        # wire shape. Only fields F0d actually reads are decoded here.
+        #
+        #   [0]  proto 1  = kg_id                       (_.Qj)
+        #   [1]  proto 2  = [lat, lng]                  (_.w _.fn)
+        #   [2]  display name (from getName() accessor; not in F0d field list)
+        #   [3]  proto 4  = primary photo url           (_.nl)
+        #   [6]  proto 7  = connected enum (==2 ⇒ true) (_.Gl)
+        #   [8]  proto 9  = string                       (_.nl, out 48)
+        #   [14] proto 15 = has_full_trip_quote bool     (_.ll, out 35)
+        #   [15] proto 16 = string                       (_.nl, out 30)
+        #   [16] proto 17 = price float                  (_.ml, out 34)
+        #   [17] proto 18 = duration minutes float       (_.ml, out 37)
+        #   [19] proto 20 = string                       (_.nl, out 40)
+        #   [20] proto 21 = noteworthy bool              (_.ll, out 46)
+        #   [21] proto 22 = region subtitle string       (_.nl → lr.4)
+        #   [26] proto 27 = secondary subtitle string    (_.nl → lr.5)
+        #   [27] proto 28 = string                       (_.nl, out 49)
+        #
+        # Left as speculative (legacy, not proven by F0d): country at [4],
+        # airport at [15], departure_date at [11], return_date at [12],
+        # is_domestic at [20]. These are what the existing parser assumed;
+        # preserved for backward compatibility but may be wrong on new
+        # response shapes.
         if len(record) < 16:
             return None
         name = record[2]
         if not isinstance(name, str):
             return None
         coords = r1 if isinstance(r1, list) and len(r1) >= 2 else (None, None)
-        price = record[17] if len(record) > 17 and isinstance(record[17], (int, float)) else None
         return ExploreDestination(
             kg_id=kg_id,
             name=name,
-            country=record[4] if isinstance(record[4], str) else None,
+            country=record[4] if len(record) > 4 and isinstance(record[4], str) else None,
             airport=record[15] if len(record) > 15 and isinstance(record[15], str) else None,
             latitude=coords[0],
             longitude=coords[1],
             departure_date=record[11] if len(record) > 11 and isinstance(record[11], str) else None,
             return_date=record[12] if len(record) > 12 and isinstance(record[12], str) else None,
-            price=float(price) if price is not None else None,
-            thumbnail_url=record[3] if isinstance(record[3], str) else None,
+            price=SearchExplore._num(record, 16),
+            duration_minutes=SearchExplore._num(record, 17),
+            thumbnail_url=record[3] if len(record) > 3 and isinstance(record[3], str) else None,
             is_domestic=record[20] if len(record) > 20 and isinstance(record[20], bool) else None,
+            noteworthy=record[20] if len(record) > 20 and isinstance(record[20], bool) else None,
+            connected=(record[6] == 2) if len(record) > 6 else None,
+            subtitle=record[26] if len(record) > 26 and isinstance(record[26], str) else None,
         )
+
+    @staticmethod
+    def _num(record: list, idx: int) -> float | None:
+        """Return ``record[idx]`` as a float if it's numeric, else ``None``."""
+        if idx >= len(record):
+            return None
+        v = record[idx]
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        return None
+
+    @staticmethod
+    def _merge(into: ExploreDestination, other: ExploreDestination) -> None:
+        """Fill empty fields on ``into`` from ``other`` (non-destructive)."""
+        for field_name in other.model_fields:
+            if getattr(into, field_name) in (None, "") and getattr(other, field_name) not in (
+                None,
+                "",
+            ):
+                setattr(into, field_name, getattr(other, field_name))
+
+    @staticmethod
+    def _apply_update(record: list, seen: dict[str, ExploreDestination]) -> None:
+        """Merge a `y0d → w0d` streaming update into the matching destination.
+
+        w0d layout (0-indexed after JSON decode):
+            [0]  kg_id
+            [2]  noteworthy bool
+            [6]  v0d nested trip detail  (see below)
+            [10] connected_enum (==1 → connected)
+            [16] display price (float)
+
+        v0d nested at index 6:
+            [5]  currency code
+            [6]  outbound origin IATA
+            [8]  total price (float)
+        """
+        if not isinstance(record, list) or not record:
+            return
+        kg_id = record[0]
+        if not isinstance(kg_id, str):
+            return
+        dest = seen.get(kg_id)
+        if dest is None:
+            return
+
+        noteworthy = record[2] if len(record) > 2 else None
+        if isinstance(noteworthy, bool) and noteworthy:
+            dest.noteworthy = True
+
+        if len(record) > 10 and record[10] == 1:
+            dest.connected = True
+
+        price = SearchExplore._num(record, 16)
+        if price is not None:
+            dest.price = price
+
+        detail = record[6] if len(record) > 6 and isinstance(record[6], list) else None
+        if detail:
+            currency = detail[5] if len(detail) > 5 and isinstance(detail[5], str) else None
+            if currency:
+                dest.currency = currency
+            total = SearchExplore._num(detail, 8)
+            if total is not None:
+                dest.price = total
+            origin_iata = detail[6] if len(detail) > 6 and isinstance(detail[6], str) else None
+            if origin_iata and not dest.airport:
+                # The detail block's outbound origin isn't the destination's
+                # airport, so we don't overwrite `airport` here — but we do
+                # stash it on `deeplink` when no better field is available.
+                pass

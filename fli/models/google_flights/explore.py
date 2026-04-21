@@ -212,5 +212,10 @@ class ExploreDestination(BaseModel):
     departure_date: str | None = None
     return_date: str | None = None
     price: float | None = None
+    currency: str | None = None
+    duration_minutes: float | None = None
     thumbnail_url: str | None = None
     is_domestic: bool | None = None
+    noteworthy: bool | None = None
+    connected: bool | None = None
+    subtitle: str | None = None
