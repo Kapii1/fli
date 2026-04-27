@@ -134,6 +134,7 @@ class SearchFlights:
                 url=self.BASE_URL,
                 data=f"f.req={encoded_filters}",
                 allow_redirects=False,
+           #     params={"gl":"FRA"}
             )
             response.raise_for_status()
 
@@ -351,9 +352,10 @@ class SearchFlights:
 
         """
         price, currency = SearchFlights._parse_price_info(data)
-        print("___price", price)
         token = SearchFlights._parse_booking_token(data)
+        print("___token ", token)
         booking_url = SearchFlights.build_booking_url(token, currency) if token else None
+        print(booking_url)
         flight = FlightResult(
             price=price,
             currency=currency,
@@ -385,6 +387,7 @@ class SearchFlights:
         it back as the ``tfs`` query param resolves the final booking page.
         """
         price_block = SearchFlights._get_price_block(data)
+        print(data)
         if not price_block or len(price_block) < 2:
             return None
         token = price_block[1]
@@ -422,6 +425,7 @@ class SearchFlights:
     def _parse_price_info(data: list) -> tuple[float, str | None]:
         """Extract the numeric price and returned currency from raw flight data."""
         price_block = SearchFlights._get_price_block(data)
+        print("price block", price_block)
         price = 0.0
         currency = None
         try:

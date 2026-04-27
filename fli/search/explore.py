@@ -236,17 +236,25 @@ class SearchExplore:
     def _apply_update(record: list, seen: dict[str, ExploreDestination]) -> None:
         """Merge a `y0d → w0d` streaming update into the matching destination.
 
-        w0d layout (0-indexed after JSON decode):
-            [0]  kg_id
-            [2]  noteworthy bool
-            [6]  v0d nested trip detail  (see below)
-            [10] connected_enum (==1 → connected)
-            [16] display price (float)
+        Empirically verified wire format (reverse-engineered):
 
-        v0d nested at index 6:
-            [5]  currency code
-            [6]  outbound origin IATA
-            [8]  total price (float)
+        record layout:
+            [0]  kg_id  (string, matches primary-block kg_id)
+            [1]  [[null, round_trip_price], booking_token]  — price-block format
+            [2]  noteworthy bool
+            [6]  trip_detail list (v0d):
+                     [0]  airline IATA code (e.g. 'AZ')
+                     [1]  airline name (e.g. 'ITA')
+                     [3]  flight duration minutes (outbound)
+                     [5]  destination airport IATA  ← NOT currency (doc was wrong)
+                     [6]  origin city/region KG id
+                     [8]  one-way outbound price (NOT the round-trip total)
+            [10] connected_enum (==1 → connected)
+            [16] display price (float, sometimes set, sometimes absent)
+
+        The correct round-trip price is at record[1][0][1] (price-block),
+        identical to the format _parse_destination uses for specific-date records.
+        record[6][8] is a one-way or partial price — do NOT use it as the total.
         """
         if not isinstance(record, list) or not record:
             return
@@ -264,21 +272,37 @@ class SearchExplore:
         if len(record) > 10 and record[10] == 1:
             dest.connected = True
 
-        price = SearchExplore._num(record, 16)
-        if price is not None:
-            dest.price = price
+        # Primary price source: record[1] = [[null, price], booking_token]
+        # This is the same price-block format used by _parse_destination for
+        # specific-date records, and contains the correct round-trip total.
+        r1 = record[1] if len(record) > 1 else None
+        if isinstance(r1, list) and r1 and isinstance(r1[0], list):
+            price_block = r1[0]
+            pb_price = (
+                float(price_block[1])
+                if len(price_block) > 1 and isinstance(price_block[1], (int, float))
+                   and not isinstance(price_block[1], bool)
+                   and price_block[1] > 0
+                else None
+            )
+            if pb_price is not None:
+                dest.price = pb_price
 
+        # Fallback: record[16] display price (present in some response shapes).
+        display_price = SearchExplore._num(record, 16)
+        if display_price is not None and display_price > 0:
+            # Only use display price if we didn't get a price-block price,
+            # or if it's higher (price-block tends to be more accurate).
+            if dest.price is None:
+                dest.price = display_price
+
+        # record[6] is the trip_detail block.  We extract the destination
+        # airport from v0d[5] (NOT the currency — field [5] is the IATA code
+        # of the destination airport).  We deliberately skip v0d[8] because
+        # it is a one-way segment price, not the round-trip total.
         detail = record[6] if len(record) > 6 and isinstance(record[6], list) else None
         if detail:
-            currency = detail[5] if len(detail) > 5 and isinstance(detail[5], str) else None
-            if currency:
-                dest.currency = currency
-            total = SearchExplore._num(detail, 8)
-            if total is not None:
-                dest.price = total
-            origin_iata = detail[6] if len(detail) > 6 and isinstance(detail[6], str) else None
-            if origin_iata and not dest.airport:
-                # The detail block's outbound origin isn't the destination's
-                # airport, so we don't overwrite `airport` here — but we do
-                # stash it on `deeplink` when no better field is available.
-                pass
+            # v0d[5] = destination airport IATA (e.g. 'FCO')
+            dest_iata = detail[5] if len(detail) > 5 and isinstance(detail[5], str) else None
+            if dest_iata and not dest.airport:
+                dest.airport = dest_iata
