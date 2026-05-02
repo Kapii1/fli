@@ -10,7 +10,9 @@ cheapest dates/prices Google has indexed. It is complementary to
 """
 
 import json
+import urllib.parse
 
+from fli.core.currency import extract_currency_from_price_token
 from fli.models.google_flights.explore import ExploreDestination, ExploreSearchFilters
 from fli.search.client import get_fast_client
 
@@ -37,12 +39,24 @@ class SearchExplore:
         """
         self.client = get_fast_client()
 
-    def search(self, filters: ExploreSearchFilters) -> list[ExploreDestination] | None:
+    def search(
+        self,
+        filters: ExploreSearchFilters,
+        currency: str | None = None,
+        hl: str | None = None,
+        gl: str | None = None,
+    ) -> list[ExploreDestination] | None:
         """Run an Explore query and return the flat list of destinations.
 
         Args:
             filters: Configured :class:`ExploreSearchFilters` describing the origin,
                 trip type, date range, cabin class, etc.
+            currency: Optional 3-letter currency code forwarded as ``?curr=`` so
+                Google returns prices in that currency instead of choosing one
+                from the egress IP / locale.
+            hl: Optional UI language code (e.g. ``"en"``).
+            gl: Optional country / region code (e.g. ``"US"``); influences which
+                results Google considers for the explore destination set.
 
         Returns:
             A list of :class:`ExploreDestination` objects in the order Google
@@ -60,8 +74,18 @@ class SearchExplore:
 
         """
         try:
+            url = self.BASE_URL
+            params: dict[str, str] = {}
+            if currency:
+                params["curr"] = currency.upper()
+            if hl:
+                params["hl"] = hl
+            if gl:
+                params["gl"] = gl
+            if params:
+                url = f"{url}?{urllib.parse.urlencode(params)}"
             response = self.client.post(
-                url=self.BASE_URL,
+                url=url,
                 data=f"f.req={filters.encode()}",
                 impersonate="chrome",
                 allow_redirects=False,
@@ -142,6 +166,8 @@ class SearchExplore:
         if isinstance(r1, list) and r1 and isinstance(r1[0], list):
             price_block = r1[0]
             price = price_block[1] if len(price_block) > 1 and isinstance(price_block[1], (int, float)) else None
+            booking_token = r1[1] if len(r1) > 1 and isinstance(r1[1], str) else None
+            currency = extract_currency_from_price_token(booking_token)
             dest_info = record[6] if len(record) > 6 and isinstance(record[6], list) else []
             airport = dest_info[5] if len(dest_info) > 5 and isinstance(dest_info[5], str) else None
             name = dest_info[7] if len(dest_info) > 7 and isinstance(dest_info[7], str) else airport
@@ -158,6 +184,7 @@ class SearchExplore:
                 departure_date=departure_date,
                 return_date=return_date,
                 price=float(price) if price is not None else None,
+                currency=currency,
                 thumbnail_url=None,
                 is_domestic=is_domestic,
             )
@@ -287,6 +314,11 @@ class SearchExplore:
             )
             if pb_price is not None:
                 dest.price = pb_price
+            booking_token = r1[1] if len(r1) > 1 and isinstance(r1[1], str) else None
+            if booking_token and not dest.currency:
+                parsed_currency = extract_currency_from_price_token(booking_token)
+                if parsed_currency:
+                    dest.currency = parsed_currency
 
         # Fallback: record[16] display price (present in some response shapes).
         display_price = SearchExplore._num(record, 16)

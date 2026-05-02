@@ -99,7 +99,10 @@ class SearchFlights:
         self.client = get_fast_client()
 
     def search(
-        self, filters: FlightSearchFilters, top_n: int = 5
+        self, filters: FlightSearchFilters, top_n: int = 5,
+        currency: str | None = None,
+        hl: str | None = None,
+        gl: str | None = None,
     ) -> list[FlightResult | tuple[FlightResult, ...]] | None:
         """Search for flights using the given FlightSearchFilters.
 
@@ -130,11 +133,18 @@ class SearchFlights:
             # as chrome133a at construction time, and a per-call override
             # forces curl_cffi to tear down + rebuild the connection, which
             # breaks HTTP/3 and keep-alive reuse.
+            params: dict[str, str] = {}
+            if currency:
+                params["curr"] = currency.upper()
+            if hl:
+                params["hl"] = hl
+            if gl:
+                params["gl"] = gl
             response = self.client.post(
                 url=self.BASE_URL,
                 data=f"f.req={encoded_filters}",
                 allow_redirects=False,
-           #     params={"gl":"FRA"}
+                params=params or None,
             )
             response.raise_for_status()
 
@@ -161,7 +171,7 @@ class SearchFlights:
             for selected_flight in flights[:top_n]:
                 next_filters = deepcopy(filters)
                 next_filters.flight_segments[selected_count].selected_flight = selected_flight
-                next_results = self.search(next_filters, top_n=top_n)
+                next_results = self.search(next_filters, top_n=top_n, currency=currency, hl=hl, gl=gl)
                 if next_results is not None:
                     for next_result in next_results:
                         if isinstance(next_result, tuple):
