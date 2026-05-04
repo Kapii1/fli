@@ -219,3 +219,113 @@ class ExploreDestination(BaseModel):
     noteworthy: bool | None = None
     connected: bool | None = None
     subtitle: str | None = None
+
+
+class ExploreFlightDetailsFilters(BaseModel):
+    """Filters for the Google Flights ``GetExploreDestinationFlightDetails`` endpoint.
+
+    This is the per-card detail behind a single explore destination — it returns
+    actual itineraries (airline, flight numbers, exact times, booking token) for
+    one origin/destination/date combination, rather than the map-wide cheapest
+    set returned by :class:`ExploreSearchFilters`.
+
+    Reuses the same 18-element ``_.Kr`` filter block as the explore endpoint;
+    only the wrapping outer message differs (``_.Ied`` here vs ``_.Ked`` there).
+    """
+
+    origin: list[ExploreLocation]
+    destination: list[ExploreLocation]
+    from_date: str
+    to_date: str | None = None
+    trip_type: TripType = TripType.ONE_WAY
+    passenger_info: PassengerInfo = Field(default_factory=PassengerInfo)
+    stops: MaxStops = MaxStops.ANY
+    seat_type: SeatType = SeatType.ECONOMY
+    earliest_departure: NonNegativeInt | None = None
+    latest_departure: PositiveInt | None = None
+    earliest_arrival: NonNegativeInt | None = None
+    latest_arrival: PositiveInt | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ExploreFlightDetailsFilters":
+        if not self.origin:
+            raise ValueError("At least one origin location is required")
+        if not self.destination:
+            raise ValueError("Destination is required for FlightDetails")
+        if self.trip_type == TripType.MULTI_CITY:
+            raise ValueError("FlightDetails does not support multi-city trips")
+        if self.trip_type == TripType.ROUND_TRIP and not self.to_date:
+            raise ValueError("Round-trip requires to_date")
+        return self
+
+    def _filter_block(self) -> list:
+        """Build the same 18-element ``_.Kr`` block used by Explore.
+
+        Always uses the specific-date 15-element segment shape (with
+        ``travel_date`` at index [6]) since FlightDetails always queries one
+        concrete date.
+        """
+        # Reuse ExploreSearchFilters' block by constructing a sibling instance
+        # with identical fields. Easier than duplicating the 18-element layout.
+        sibling = ExploreSearchFilters(
+            origin=self.origin,
+            destination=self.destination,
+            trip_type=self.trip_type,
+            passenger_info=self.passenger_info,
+            stops=self.stops,
+            seat_type=self.seat_type,
+            from_date=self.from_date,
+            to_date=self.to_date or self.from_date,
+            earliest_departure=self.earliest_departure,
+            latest_departure=self.latest_departure,
+            earliest_arrival=self.earliest_arrival,
+            latest_arrival=self.latest_arrival,
+        )
+        return sibling._filter_block()
+
+    def format(self) -> list:
+        """Serialize into the ``_.Ied`` wire shape: ``[null, filter_block]``.
+
+        ``_.Ied`` only has one decoded field (``getConstraints()`` reads field
+        2, which is the standard 18-element filter block), so the wire array
+        is just ``[null, <block>]``.
+        """
+        return [None, self._filter_block()]
+
+    def encode(self) -> str:
+        """URL-encode the formatted request into an ``f.req`` body value."""
+        inner = json.dumps(self.format(), separators=(",", ":"))
+        return urllib.parse.quote(json.dumps([None, inner], separators=(",", ":")))
+
+
+class ExploreFlightOffer(BaseModel):
+    """One bookable itinerary returned by ``GetExploreDestinationFlightDetails``."""
+
+    price: float | None = None
+    currency: str | None = None
+    booking_token: str | None = None
+    airline_code: str | None = None
+    airline_name: str | None = None
+    stops: int | None = None
+    duration_minutes: int | None = None
+    is_best: bool | None = None
+    departure_date: str | None = None
+    origin_airport: str | None = None
+    origin_airport_name: str | None = None
+    destination_airport: str | None = None
+    destination_airport_name: str | None = None
+    origin_city_kg_id: str | None = None
+
+
+class ExploreFlightDetailsResult(BaseModel):
+    """Aggregate result for one ``GetExploreDestinationFlightDetails`` call."""
+
+    offers: list[ExploreFlightOffer] = Field(default_factory=list)
+    departure_date: str | None = None
+    return_date: str | None = None
+    destination_name: str | None = None
+    # 5 entries from the price chart block (e.g. min/typical-low/delta/median/typical-high).
+    # Order is unconfirmed across response variants — kept as a flat list.
+    price_chart: list[float | None] = Field(default_factory=list)
+    session_id: str | None = None
+    cursor_token: str | None = None

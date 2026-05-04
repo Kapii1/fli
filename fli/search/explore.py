@@ -13,7 +13,13 @@ import json
 import urllib.parse
 
 from fli.core.currency import extract_currency_from_price_token
-from fli.models.google_flights.explore import ExploreDestination, ExploreSearchFilters
+from fli.models.google_flights.explore import (
+    ExploreDestination,
+    ExploreFlightDetailsFilters,
+    ExploreFlightDetailsResult,
+    ExploreFlightOffer,
+    ExploreSearchFilters,
+)
 from fli.search.client import get_fast_client
 
 
@@ -338,3 +344,203 @@ class SearchExplore:
             dest_iata = detail[5] if len(detail) > 5 and isinstance(detail[5], str) else None
             if dest_iata and not dest.airport:
                 dest.airport = dest_iata
+
+
+class SearchExploreDetails:
+    """Per-destination flight detail search.
+
+    Wraps Google Flights' ``GetExploreDestinationFlightDetails`` endpoint —
+    the request that fires when a user clicks a destination card on the
+    explore map and the panel populates with actual airline / time / price
+    options.
+
+    Wire shape (reverse-engineered from the FlightsFrontendUi build):
+
+    * Request type ``_.Ied`` exposes one decoded field via ``getConstraints()``
+      — the same 18-element ``_.Kr`` filter block used by
+      ``GetExploreDestinations``. Outer wire array is ``[null, filter_block]``.
+    * Response type ``_.Ced`` (proto tag ``j33LJc``) is a thin wrapper with one
+      field reading a ``_.Qr`` payload at field 1; each streamed frame contains
+      one such wrapper.
+
+    The endpoint is HTTP server-streaming, but in practice we observe the
+    full result delivered in a single ``wrb.fr`` frame followed by the usual
+    ``di`` / ``af.httprm`` / ``e`` housekeeping frames.
+    """
+
+    BASE_URL = (
+        "https://www.google.com/_/FlightsFrontendUi/data/"
+        "travel.frontend.flights.FlightsFrontendService/GetExploreDestinationFlightDetails"
+    )
+    DEFAULT_HEADERS = {
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+    }
+
+    def __init__(self):
+        self.client = get_fast_client()
+
+    def search(
+        self,
+        filters: ExploreFlightDetailsFilters,
+        currency: str | None = None,
+        hl: str | None = None,
+        gl: str | None = None,
+    ) -> ExploreFlightDetailsResult | None:
+        """Run a FlightDetails query and return the parsed result."""
+        try:
+            url = self.BASE_URL
+            params: dict[str, str] = {}
+            if currency:
+                params["curr"] = currency.upper()
+            if hl:
+                params["hl"] = hl
+            if gl:
+                params["gl"] = gl
+            if params:
+                url = f"{url}?{urllib.parse.urlencode(params)}"
+            response = self.client.post(
+                url=url,
+                data=f"f.req={filters.encode()}",
+                impersonate="chrome",
+                allow_redirects=False,
+            )
+            response.raise_for_status()
+
+            envelope = json.loads(response.content.lstrip(b")]}'"))
+            wrb_entries = [
+                row for row in envelope if isinstance(row, list) and row and row[0] == "wrb.fr"
+            ]
+            if not wrb_entries:
+                return None
+
+            result = ExploreFlightDetailsResult()
+            for wrb in wrb_entries:
+                if len(wrb) < 3 or not wrb[2]:
+                    continue
+                inner = json.loads(wrb[2])
+                self._merge_payload(inner, result)
+            return result if result.offers or result.session_id else None
+
+        except Exception as e:
+            raise Exception(f"FlightDetails search failed: {str(e)}") from e
+
+    @staticmethod
+    def _merge_payload(payload: list, result: ExploreFlightDetailsResult) -> None:
+        """Merge one decoded ``_.Qr`` payload into the accumulating result.
+
+        Wire shape (JSPB array index → proto field number − 1):
+
+        * ``[0]``  field 1 — session block: ``[None, [reqId,...], 0, session_id, cursor_token]``
+        * ``[1]``  field 2 — repeated FlightOffer
+        * ``[2]``  field 3 — date range ``[departure_date, return_date]``
+        * ``[4]``  field 5 — price-chart summary; trailing string is the
+                              destination city display name
+        * ``[10]`` field 11 — chunk metadata
+        """
+        if not isinstance(payload, list) or not payload:
+            return
+
+        session_block = payload[0] if len(payload) > 0 else None
+        if isinstance(session_block, list):
+            if len(session_block) > 3 and isinstance(session_block[3], str):
+                result.session_id = result.session_id or session_block[3]
+            if len(session_block) > 4 and isinstance(session_block[4], str):
+                result.cursor_token = result.cursor_token or session_block[4]
+
+        offers_block = payload[1] if len(payload) > 1 else None
+        if isinstance(offers_block, list):
+            for record in offers_block:
+                offer = SearchExploreDetails._parse_offer(record)
+                if offer is not None:
+                    result.offers.append(offer)
+
+        date_range = payload[2] if len(payload) > 2 else None
+        if isinstance(date_range, list):
+            if len(date_range) > 0 and isinstance(date_range[0], str):
+                result.departure_date = date_range[0]
+            if len(date_range) > 1 and isinstance(date_range[1], str):
+                result.return_date = date_range[1]
+
+        chart = payload[4] if len(payload) > 4 else None
+        if isinstance(chart, list):
+            prices: list[float | None] = []
+            for entry in chart:
+                # Each `[null, value]` pair encodes one price-chart point.
+                if (
+                    isinstance(entry, list)
+                    and len(entry) > 1
+                    and isinstance(entry[1], (int, float))
+                    and not isinstance(entry[1], bool)
+                ):
+                    prices.append(float(entry[1]))
+            if prices:
+                result.price_chart = prices
+            for entry in reversed(chart):
+                if isinstance(entry, str):
+                    result.destination_name = entry
+                    break
+
+    @staticmethod
+    def _parse_offer(record: list) -> ExploreFlightOffer | None:
+        """Decode one 20-field FlightOffer record.
+
+        Field map (JSPB array index → meaning), from a captured live response:
+
+        * [0]  ``[[null, price], booking_token]``
+        * [1]  airline IATA code
+        * [2]  airline display name
+        * [3]  stops count
+        * [4]  duration minutes
+        * [5]  is_best bool (set on the highlighted offer; null otherwise)
+        * [6]  departure date (``YYYY-MM-DD``)
+        * [7]  origin airport IATA
+        * [8]  origin airport display name
+        * [9]  destination airport IATA
+        * [10] destination airport display name
+        * [13] origin city KG id (``/m/...``)
+        """
+        if not isinstance(record, list) or len(record) < 11:
+            return None
+
+        price: float | None = None
+        currency: str | None = None
+        booking_token: str | None = None
+        r0 = record[0]
+        if isinstance(r0, list) and r0:
+            price_block = r0[0]
+            if (
+                isinstance(price_block, list)
+                and len(price_block) > 1
+                and isinstance(price_block[1], (int, float))
+                and not isinstance(price_block[1], bool)
+            ):
+                price = float(price_block[1])
+            if len(r0) > 1 and isinstance(r0[1], str):
+                booking_token = r0[1]
+                currency = extract_currency_from_price_token(booking_token)
+
+        def _str(idx: int) -> str | None:
+            return record[idx] if idx < len(record) and isinstance(record[idx], str) else None
+
+        def _int(idx: int) -> int | None:
+            v = record[idx] if idx < len(record) else None
+            return int(v) if isinstance(v, int) and not isinstance(v, bool) else None
+
+        is_best = record[5] if len(record) > 5 and isinstance(record[5], bool) else None
+
+        return ExploreFlightOffer(
+            price=price,
+            currency=currency,
+            booking_token=booking_token,
+            airline_code=_str(1),
+            airline_name=_str(2),
+            stops=_int(3),
+            duration_minutes=_int(4),
+            is_best=is_best,
+            departure_date=_str(6),
+            origin_airport=_str(7),
+            origin_airport_name=_str(8),
+            destination_airport=_str(9),
+            destination_airport_name=_str(10),
+            origin_city_kg_id=_str(13),
+        )

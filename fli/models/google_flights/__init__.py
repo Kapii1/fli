@@ -16,6 +16,9 @@ from .base import (
 from .dates import DateSearchFilters
 from .explore import (
     ExploreDestination,
+    ExploreFlightDetailsFilters,
+    ExploreFlightDetailsResult,
+    ExploreFlightOffer,
     ExploreLocation,
     ExploreLocationType,
     ExploreSearchFilters,
@@ -29,6 +32,9 @@ __all__ = [
     "DateSearchFilters",
     "EmissionsFilter",
     "ExploreDestination",
+    "ExploreFlightDetailsFilters",
+    "ExploreFlightDetailsResult",
+    "ExploreFlightOffer",
     "ExploreLocation",
     "ExploreLocationType",
     "ExploreSearchFilters",
