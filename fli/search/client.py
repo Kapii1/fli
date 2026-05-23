@@ -174,7 +174,10 @@ class FastClient:
     Auth / 4xx errors fail fast.
     """
 
-    REQUEST_TIMEOUT = 5
+    # Google actively slow-serves throttled origins with ~22 s responses.
+    # 20 s matches what _make_search_explore() used to set per-call;
+    # setting it here covers SearchFlights and SearchExploreDetails too.
+    REQUEST_TIMEOUT = 20
 
     def __init__(self):
         """Build a fresh DoH-resolved session."""
