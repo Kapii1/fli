@@ -152,6 +152,54 @@ Find the cheapest travel dates between two airports within a date range.
 }
 ```
 
+### `explore_destinations`
+
+Discover the cheapest destinations reachable from an origin airport — answers
+"where can I fly cheaply from X?". Dates are optional: omit them to search
+Google's flexible "best price" index, or pin them for date-accurate prices.
+
+**Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `origin` | string | Yes | - | Departure airport IATA code (e.g., 'JFK') |
+| `departure_date` | string | No | null | Outbound date in YYYY-MM-DD format (omit for flexible dates) |
+| `return_date` | string | No | null | Return date (requires `departure_date`; implies round-trip) |
+| `trip_duration` | int | No | null | Trip length in days for flexible round-trip searches |
+| `cabin_class` | string | No | ECONOMY | ECONOMY, PREMIUM_ECONOMY, BUSINESS, or FIRST |
+| `max_stops` | string | No | ANY | ANY, NON_STOP, ONE_STOP, or TWO_PLUS_STOPS |
+| `passengers` | int | No | 1 | Number of adult passengers |
+| `currency` | string | No | null | 3-letter currency code for prices (e.g., 'EUR') |
+| `sort_by_price` | bool | No | false | Sort destinations by price (lowest first) |
+
+**Example Response:**
+
+```json
+{
+  "success": true,
+  "destinations": [
+    {
+      "name": "Rome",
+      "country": "Italy",
+      "airport": "FCO",
+      "price": 89.0,
+      "currency": "EUR",
+      "departure_date": "2026-09-26",
+      "return_date": "2026-10-03",
+      "flight_duration_minutes": 135.0,
+      "airline_code": "AZ",
+      "airline_name": "ITA Airways",
+      "latitude": 41.9028,
+      "longitude": 12.4964,
+      "noteworthy": true,
+      "subtitle": "Lazio"
+    }
+  ],
+  "count": 120,
+  "trip_type": "ROUND_TRIP"
+}
+```
+
 ## Available Prompts
 
 The MCP server also provides prompt templates to help guide searches:
@@ -176,6 +224,16 @@ Suggests the cheapest travel dates for a route within a flexible window.
 - `start_date` - Start of the travel window (optional)
 - `end_date` - End of the travel window (optional)
 - `duration` - Desired trip length in days (optional)
+
+### `explore-cheap-destinations`
+
+Discovers the cheapest destinations reachable from an origin airport.
+
+**Arguments:**
+- `origin` - Departure airport IATA code (required)
+- `departure_date` - Outbound date in YYYY-MM-DD format (optional)
+- `return_date` - Return date in YYYY-MM-DD format (optional)
+- `duration` - Desired trip length in days for flexible searches (optional)
 
 ## Configuration
 
@@ -205,3 +263,7 @@ Once configured with Claude Desktop, you can have natural conversations:
 > **User**: "Search for business class, non-stop flights from LAX to Paris on March 15th"
 > 
 > **Claude**: *Uses `search_flights` with cabin_class=BUSINESS, max_stops=NON_STOP*
+
+> **User**: "Where can I fly cheaply from Paris for a week in September?"
+> 
+> **Claude**: *Uses `explore_destinations` with origin=CDG, trip_duration=7, sort_by_price=true*

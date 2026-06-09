@@ -73,7 +73,7 @@ uv run mkdocs build         # Build static docs
    - All models use Pydantic for validation
 
 5. **MCP Server** (`fli/mcp/`)
-   - FastMCP-based server with two tools: `search_flights` and `search_dates`
+   - FastMCP-based server with three tools: `search_flights`, `search_dates` and `explore_destinations`
    - Industry-standard parameter naming: `origin`, `destination`, `cabin_class`, `max_stops`
    - Prompt templates for guided searches
    - Configuration via environment variables
@@ -95,7 +95,7 @@ uv run mkdocs build         # Build static docs
 ## Key Files and Entry Points
 
 - `fli/cli/main.py` - CLI entry point and command registration
-- `fli/mcp/server.py` - MCP server with `search_flights` and `search_dates` tools
+- `fli/mcp/server.py` - MCP server with `search_flights`, `search_dates` and `explore_destinations` tools
 - `fli/core/parsers.py` - Shared parsing utilities
 - `fli/core/builders.py` - Shared filter building utilities
 - `fli/search/flights.py` - Core flight search implementation
@@ -126,6 +126,17 @@ Find cheapest travel dates within a range.
 - `trip_duration` - Number of days for round trips
 - `is_round_trip` - Boolean for round-trip search
 - `cabin_class`, `max_stops`, `departure_window`, `airlines` - Same as above
+- `sort_by_price` - Boolean to sort by price
+
+### `explore_destinations`
+Discover the cheapest destinations from an origin ("where can I fly cheaply from X?").
+
+**Key Parameters:**
+- `origin` - Airport IATA code
+- `departure_date` / `return_date` - Optional dates in YYYY-MM-DD format (omit for flexible search)
+- `trip_duration` - Days, for flexible round-trip searches
+- `currency` - 3-letter code for returned prices
+- `cabin_class`, `max_stops` - Same as above
 - `sort_by_price` - Boolean to sort by price
 
 ## Code Style and Standards

@@ -212,6 +212,16 @@ class FastClient:
         "curl: (56)",
     )
 
+    # Set after a fast QUIC/TLS failure: some hosts cannot speak HTTP/3 at
+    # all (UDP 443 blocked, curl built without TLS 1.3, corporate proxies).
+    # Class-level so every per-search instance skips the doomed h3 attempt
+    # once one has failed, instead of re-failing on each search. Only
+    # failures faster than _H3_FAIL_FAST_S set it — a 20 s stall whose error
+    # text happens to mention QUIC is a transient throttle, not proof that
+    # the environment lacks HTTP/3.
+    _h3_unavailable = False
+    _H3_FAIL_FAST_S = 5.0
+
     def __init__(self):
         """Build a fresh DoH-resolved session."""
         self._client = _make_resolved_session(0)
@@ -229,7 +239,9 @@ class FastClient:
     def post(self, url: str, **kwargs: Any) -> requests.Response:
         """POST with HTTP/3, hedging onto a fresh session if the first stalls.
 
-        At most :attr:`MAX_ATTEMPTS` sessions are used and no new attempt is
+        Falls back to HTTP/2 — and remembers it class-wide — when the
+        environment cannot complete a QUIC handshake at all. At most
+        :attr:`MAX_ATTEMPTS` sessions are used and no new attempt is
         launched once :attr:`REQUEST_TIMEOUT` has elapsed, so the worst case
         is ``HEDGE_DELAY + REQUEST_TIMEOUT`` instead of the serial
         ``2 × REQUEST_TIMEOUT`` of a fail-then-retry strategy.
@@ -237,17 +249,38 @@ class FastClient:
         # chrome133a is already applied at the session level; a per-call
         # impersonate= kwarg overrides it and breaks H3 + keep-alive reuse.
         kwargs.pop("impersonate", None)
-        kwargs.setdefault("http_version", CurlHttpVersion.V3)
         kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
+        forced_version = kwargs.pop("http_version", None)
 
         results: _Queue = _Queue()
 
+        def _version() -> int:
+            if forced_version is not None:
+                return forced_version
+            if FastClient._h3_unavailable:
+                return CurlHttpVersion.V2TLS
+            return CurlHttpVersion.V3
+
         def _run(sess: requests.Session, own_session: bool) -> None:
+            version = _version()
+            attempt_started = _time.monotonic()
             try:
-                response = sess.post(url, **kwargs)
+                response = sess.post(url, http_version=version, **kwargs)
                 response.raise_for_status()
                 results.put(("ok", response))
             except Exception as exc:
+                err = str(exc).lower()
+                if (
+                    version == CurlHttpVersion.V3
+                    and forced_version is None
+                    and _time.monotonic() - attempt_started < self._H3_FAIL_FAST_S
+                    and ("quic" in err or "tls" in err)
+                ):
+                    # Fast QUIC/TLS failure: this environment cannot do
+                    # HTTP/3. Remember it so the replacement this error is
+                    # about to trigger (and every later search) goes straight
+                    # to HTTP/2.
+                    FastClient._h3_unavailable = True
                 results.put(("err", exc))
             finally:
                 # Replacement sessions are created per-attempt; the response

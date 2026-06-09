@@ -10,9 +10,18 @@ import threading
 import time
 
 import pytest
+from curl_cffi import CurlHttpVersion
 
 from fli.search import client as client_mod
 from fli.search.client import FastClient
+
+
+@pytest.fixture(autouse=True)
+def reset_h3_flag():
+    """Isolate the class-level h3-availability flag between tests."""
+    FastClient._h3_unavailable = False
+    yield
+    FastClient._h3_unavailable = False
 
 
 class FakeResponse:
@@ -219,4 +228,96 @@ def test_no_new_attempts_after_timeout_budget_spent(fast_client, monkeypatch):
 
     # Budget (0.2 s) was already spent when the primary failed at 0.3 s,
     # so no replacement session may be launched.
+    assert fast_client.handed_out == []
+
+
+# ── HTTP/3 → HTTP/2 environment fallback ─────────────────────────────────────
+
+
+class QuicBrokenSession(FakeSession):
+    """Records http_version per post; fails HTTP/3 the way a QUIC-less host does."""
+
+    def __init__(self, tag: str):
+        """Start with no versions seen."""
+        super().__init__(tag)
+        self.versions_seen: list[int] = []
+
+    def post(self, url, http_version=None, **kwargs):
+        self.versions_seen.append(http_version)
+        if http_version == CurlHttpVersion.V3:
+            raise Exception("Failed to perform, curl: (28) QUIC needs at least TLS version 1.3.")
+        return FakeResponse(self.tag)
+
+
+def test_falls_back_to_http2_when_quic_unavailable(fast_client):
+    primary = QuicBrokenSession("primary")
+    replacement = QuicBrokenSession("replacement")
+    fast_client._client = primary
+    fast_client.pending.append(replacement)
+    fast_client.HEDGE_DELAY = 10.0
+
+    response = fast_client.post(URL)
+
+    # Primary burned the doomed h3 attempt; the immediate replacement was
+    # already downgraded to h2 by the class-level flag.
+    assert response.tag == "replacement"
+    assert primary.versions_seen == [CurlHttpVersion.V3]
+    assert replacement.versions_seen == [CurlHttpVersion.V2TLS]
+    assert FastClient._h3_unavailable is True
+
+
+def test_remembers_h3_unavailability_across_instances(fast_client):
+    fast_client._client = QuicBrokenSession("primary")
+    fast_client.pending.append(QuicBrokenSession("replacement"))
+    fast_client.HEDGE_DELAY = 10.0
+    fast_client.post(URL)
+
+    second = QuicBrokenSession("second-primary")
+    fast_client._client = second
+    response = fast_client.post(URL)
+
+    # The second request must skip the doomed HTTP/3 attempt entirely.
+    assert response.tag == "second-primary"
+    assert second.versions_seen == [CurlHttpVersion.V2TLS]
+
+
+def test_explicit_http_version_is_respected_and_not_downgraded(fast_client):
+    primary = QuicBrokenSession("primary")
+    fast_client._client = primary
+    fast_client.pending.append(QuicBrokenSession("retry1"))
+    fast_client.pending.append(QuicBrokenSession("retry2"))
+    fast_client.HEDGE_DELAY = 10.0
+
+    with pytest.raises(Exception, match="QUIC"):
+        fast_client.post(URL, http_version=CurlHttpVersion.V3)
+
+    # A forced version is honored on every attempt and never flips the flag.
+    assert primary.versions_seen == [CurlHttpVersion.V3]
+    assert all(s.versions_seen == [CurlHttpVersion.V3] for s in fast_client.handed_out)
+    assert FastClient._h3_unavailable is False
+
+
+def test_slow_quic_stall_does_not_disable_h3(fast_client, monkeypatch):
+    monkeypatch.setattr(FastClient, "_H3_FAIL_FAST_S", 0.05)
+    fast_client._client = FakeSession(
+        "primary", delay=0.2, error=Exception("curl: (28) QUIC needs at least ...")
+    )
+    fast_client.pending.append(FakeSession("retry", delay=0.0))
+    fast_client.HEDGE_DELAY = 10.0
+
+    response = fast_client.post(URL)
+
+    # The stalled-then-failed h3 attempt was rescued by a replacement, but a
+    # slow stall is throttling, not a missing-QUIC environment: keep h3 on.
+    assert response.tag == "retry"
+    assert FastClient._h3_unavailable is False
+
+
+def test_non_retriable_errors_fail_fast(fast_client):
+    fast_client._client = FakeSession("primary", error=Exception("HTTP Error 403: Forbidden"))
+    fast_client.HEDGE_DELAY = 10.0
+
+    with pytest.raises(Exception, match="403"):
+        fast_client.post(URL)
+
     assert fast_client.handed_out == []
