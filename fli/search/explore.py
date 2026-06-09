@@ -121,9 +121,15 @@ class SearchExplore:
                         if not isinstance(group, list):
                             continue
                         for record in group:
-                            parsed = self._parse_destination(
-                                record, filters.from_date, filters.to_date
-                            )
+                            # One malformed record must not abort the whole
+                            # search — Google occasionally streams partial or
+                            # novel shapes alongside hundreds of good ones.
+                            try:
+                                parsed = self._parse_destination(
+                                    record, filters.from_date, filters.to_date
+                                )
+                            except Exception:
+                                continue
                             if parsed is None:
                                 continue
                             existing = seen.get(parsed.kg_id)
@@ -138,7 +144,10 @@ class SearchExplore:
                         if not isinstance(group, list):
                             continue
                         for record in group:
-                            self._apply_update(record, seen)
+                            try:
+                                self._apply_update(record, seen)
+                            except Exception:
+                                continue
 
             destinations = list(seen.values())
 
@@ -157,7 +166,7 @@ class SearchExplore:
 
         Handles two wire formats emitted by GetExploreDestinations:
         - Cheapest-date mode (29-element): record[1]=[lat,lon], record[2]=name,
-          record[17]=price
+          record[16]=price
         - Specific-date mode (16-element): record[1]=[[null,price],token],
           record[6]=[..., airport, kg, name, ...]
         """
@@ -171,7 +180,7 @@ class SearchExplore:
         # Specific-date format: record[1] is [[null, price], booking_token]
         if isinstance(r1, list) and r1 and isinstance(r1[0], list):
             price_block = r1[0]
-            price = price_block[1] if len(price_block) > 1 and isinstance(price_block[1], (int, float)) else None
+            price = SearchExplore._num(price_block, 1)
             booking_token = r1[1] if len(r1) > 1 and isinstance(r1[1], str) else None
             currency = extract_currency_from_price_token(booking_token)
             dest_info = record[6] if len(record) > 6 and isinstance(record[6], list) else []
@@ -217,29 +226,32 @@ class SearchExplore:
         #   [27] proto 28 = string                       (_.nl, out 49)
         #
         # Left as speculative (legacy, not proven by F0d): country at [4],
-        # airport at [15], departure_date at [11], return_date at [12],
-        # is_domestic at [20]. These are what the existing parser assumed;
-        # preserved for backward compatibility but may be wrong on new
-        # response shapes.
+        # airport at [15], departure_date at [11], return_date at [12].
+        # These are what the existing parser assumed; preserved for backward
+        # compatibility but may be wrong on new response shapes.
         if len(record) < 16:
             return None
         name = record[2]
         if not isinstance(name, str):
             return None
-        coords = r1 if isinstance(r1, list) and len(r1) >= 2 else (None, None)
+        latitude = SearchExplore._num(r1, 0) if isinstance(r1, list) else None
+        longitude = SearchExplore._num(r1, 1) if isinstance(r1, list) else None
         return ExploreDestination(
             kg_id=kg_id,
             name=name,
             country=record[4] if len(record) > 4 and isinstance(record[4], str) else None,
             airport=record[15] if len(record) > 15 and isinstance(record[15], str) else None,
-            latitude=coords[0],
-            longitude=coords[1],
+            latitude=latitude,
+            longitude=longitude,
             departure_date=record[11] if len(record) > 11 and isinstance(record[11], str) else None,
             return_date=record[12] if len(record) > 12 and isinstance(record[12], str) else None,
             price=SearchExplore._num(record, 16),
             duration_minutes=SearchExplore._num(record, 17),
             thumbnail_url=record[3] if len(record) > 3 and isinstance(record[3], str) else None,
-            is_domestic=record[20] if len(record) > 20 and isinstance(record[20], bool) else None,
+            # [20] is `noteworthy` per the F0d decoder. The old parser also
+            # mirrored it into is_domestic, which was wrong — domesticity is
+            # only known in specific-date mode (record[9]).
+            is_domestic=None,
             noteworthy=record[20] if len(record) > 20 and isinstance(record[20], bool) else None,
             connected=(record[6] == 2) if len(record) > 6 else None,
             subtitle=record[26] if len(record) > 26 and isinstance(record[26], str) else None,
@@ -258,7 +270,7 @@ class SearchExplore:
     @staticmethod
     def _merge(into: ExploreDestination, other: ExploreDestination) -> None:
         """Fill empty fields on ``into`` from ``other`` (non-destructive)."""
-        for field_name in other.model_fields:
+        for field_name in type(other).model_fields:
             if getattr(into, field_name) in (None, "") and getattr(other, field_name) not in (
                 None,
                 "",
@@ -276,14 +288,17 @@ class SearchExplore:
             [1]  [[null, round_trip_price], booking_token]  — price-block format
             [2]  noteworthy bool
             [6]  trip_detail list (v0d):
-                     [0]  airline IATA code (e.g. 'AZ')
+                     [0]  airline IATA code (e.g. 'AZ'; 'multi' for mixed)
                      [1]  airline name (e.g. 'ITA')
-                     [3]  flight duration minutes (outbound)
+                     [3]  flight duration minutes (outbound; 0 for ground routes)
                      [5]  destination airport IATA  ← NOT currency (doc was wrong)
                      [6]  origin city/region KG id
                      [8]  one-way outbound price (NOT the round-trip total)
             [10] connected_enum (==1 → connected)
-            [16] display price (float, sometimes set, sometimes absent)
+            [15] [[null, display_price]] — price pair, set even on ground
+                 ("connected") destinations that have no booking price-block
+            [16] small enum (3/4 observed); an OLDER shape carried a display
+                 price here — never treat it as a price anymore
 
         The correct round-trip price is at record[1][0][1] (price-block),
         identical to the format _parse_destination uses for specific-date records.
@@ -326,13 +341,16 @@ class SearchExplore:
                 if parsed_currency:
                     dest.currency = parsed_currency
 
-        # Fallback: record[16] display price (present in some response shapes).
-        display_price = SearchExplore._num(record, 16)
-        if display_price is not None and display_price > 0:
-            # Only use display price if we didn't get a price-block price,
-            # or if it's higher (price-block tends to be more accurate).
-            if dest.price is None:
-                dest.price = display_price
+        # Fallback: record[15] = [[null, display_price]] pair. Used when the
+        # booking price-block is absent (e.g. ground "connected" destinations
+        # where Google shows a train/bus price). record[16] used to hold a
+        # display price but now carries a small enum — never read it as one.
+        if dest.price is None and len(record) > 15 and isinstance(record[15], list) and record[15]:
+            pair = record[15][0]
+            if isinstance(pair, list):
+                display_price = SearchExplore._num(pair, 1)
+                if display_price is not None and display_price > 0:
+                    dest.price = display_price
 
         # record[6] is the trip_detail block.  We extract the destination
         # airport from v0d[5] (NOT the currency — field [5] is the IATA code
@@ -344,6 +362,17 @@ class SearchExplore:
             dest_iata = detail[5] if len(detail) > 5 and isinstance(detail[5], str) else None
             if dest_iata and not dest.airport:
                 dest.airport = dest_iata
+            # v0d[0]/[1] = airline of the cheapest itinerary Google found.
+            airline_code = detail[0] if len(detail) > 0 and isinstance(detail[0], str) else None
+            if airline_code and not dest.airline_code:
+                dest.airline_code = airline_code
+            airline_name = detail[1] if len(detail) > 1 and isinstance(detail[1], str) else None
+            if airline_name and not dest.airline_name:
+                dest.airline_name = airline_name
+            # v0d[3] = outbound flight duration in minutes (0 on ground routes).
+            duration = SearchExplore._num(detail, 3)
+            if duration is not None and duration > 0 and dest.duration_minutes is None:
+                dest.duration_minutes = duration
 
 
 class SearchExploreDetails:

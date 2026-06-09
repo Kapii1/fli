@@ -179,6 +179,12 @@ class FastClient:
     # setting it here covers SearchFlights and SearchExploreDetails too.
     REQUEST_TIMEOUT = 20
 
+    # Set after the first QUIC/TLS failure: some hosts cannot speak HTTP/3 at
+    # all (UDP 443 blocked, curl built without TLS 1.3, corporate proxies).
+    # Class-level so every per-search instance skips the doomed h3 attempt
+    # once one has failed, instead of re-failing on each search.
+    _h3_unavailable = False
+
     def __init__(self):
         """Build a fresh DoH-resolved session."""
         self._client = _make_resolved_session(0)
@@ -189,30 +195,52 @@ class FastClient:
             self._client.close()
 
     def post(self, url: str, **kwargs: Any) -> requests.Response:
-        """POST with HTTP/3, retrying once against a rotated IP on stalls."""
+        """POST with HTTP/3, falling back to HTTP/2 if QUIC is unavailable.
+
+        Retries once against a rotated IP on network stalls (timeouts,
+        resolution failures); auth / 4xx errors fail fast.
+        """
         # chrome133a is already applied at the session level; a per-call
         # impersonate= kwarg overrides it and breaks H3 + keep-alive reuse.
         kwargs.pop("impersonate", None)
-        kwargs.setdefault("http_version", CurlHttpVersion.V3)
         kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
+        forced_version = kwargs.pop("http_version", None)
 
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            sess = self._client if attempt == 0 else _make_resolved_session(_next_ip_index())
+        sess = self._client
+        h3_retried = False
+        stall_retried = False
+        while True:
+            if forced_version is not None:
+                version = forced_version
+            elif FastClient._h3_unavailable:
+                version = CurlHttpVersion.V2TLS
+            else:
+                version = CurlHttpVersion.V3
             try:
-                response = sess.post(url, **kwargs)
+                response = sess.post(url, http_version=version, **kwargs)
                 response.raise_for_status()
                 return response
             except Exception as exc:
-                last_exc = exc
                 err = str(exc).lower()
+                if (
+                    version == CurlHttpVersion.V3
+                    and forced_version is None
+                    and not h3_retried
+                    and ("quic" in err or "tls" in err)
+                ):
+                    # This environment cannot do HTTP/3 — remember it and
+                    # retry the same request over HTTP/2 immediately.
+                    FastClient._h3_unavailable = True
+                    h3_retried = True
+                    continue
                 retriable = (
                     "timed out" in err or "timeout" in err or "could not resolve" in err
                 )
-                if attempt == 0 and retriable:
+                if retriable and not stall_retried:
+                    stall_retried = True
+                    sess = _make_resolved_session(_next_ip_index())
                     continue
                 raise Exception(f"POST request failed: {exc}") from exc
-        raise Exception(f"POST request failed after retry: {last_exc}")
 
 
 def get_client() -> Client:

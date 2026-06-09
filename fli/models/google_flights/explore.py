@@ -214,6 +214,8 @@ class ExploreDestination(BaseModel):
     price: float | None = None
     currency: str | None = None
     duration_minutes: float | None = None
+    airline_code: str | None = None
+    airline_name: str | None = None
     thumbnail_url: str | None = None
     is_domestic: bool | None = None
     noteworthy: bool | None = None

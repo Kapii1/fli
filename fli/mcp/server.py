@@ -29,11 +29,13 @@ from fli.core.parsers import ParseError
 from fli.models import (
     BagsFilter,
     DateSearchFilters,
+    ExploreLocation,
+    ExploreSearchFilters,
     FlightSearchFilters,
     PassengerInfo,
     TripType,
 )
-from fli.search import SearchDates, SearchFlights
+from fli.search import SearchDates, SearchExplore, SearchFlights
 
 
 class FlightSearchConfig(BaseSettings):
@@ -159,6 +161,40 @@ class DateSearchParams(BaseModel):
     )
 
 
+class ExploreParams(BaseModel):
+    """Parameters for discovering cheap destinations from an origin."""
+
+    origin: str = Field(description="Departure airport IATA code (e.g., 'JFK', 'CDG')")
+    departure_date: str | None = Field(
+        None, description="Outbound date in YYYY-MM-DD format (omit for flexible dates)"
+    )
+    return_date: str | None = Field(
+        None, description="Return date in YYYY-MM-DD format (requires departure_date)"
+    )
+    trip_duration: int | None = Field(
+        None, ge=1, description="Trip length in days for flexible round-trip searches"
+    )
+    cabin_class: str = Field(
+        CONFIG.default_cabin_class,
+        description="Cabin class: ECONOMY, PREMIUM_ECONOMY, BUSINESS, or FIRST",
+    )
+    max_stops: str = Field(
+        "ANY", description="Maximum stops: ANY, NON_STOP, ONE_STOP, or TWO_PLUS_STOPS"
+    )
+    passengers: int = Field(
+        CONFIG.default_passengers,
+        ge=1,
+        description="Number of adult passengers",
+    )
+    currency: str | None = Field(
+        None,
+        min_length=3,
+        max_length=3,
+        description="3-letter currency code for prices (e.g., 'EUR'); Google picks one if omitted",
+    )
+    sort_by_price: bool = Field(False, description="Sort destinations by price (lowest first)")
+
+
 # =============================================================================
 # Result Serialization
 # =============================================================================
@@ -218,6 +254,26 @@ def _serialize_date_result(date_result: Any) -> dict[str, Any]:
         "price": date_result.price,
         "currency": date_result.currency or CONFIG.default_currency,
         "return_date": getattr(date_result, "return_date", None),
+    }
+
+
+def _serialize_explore_destination(dest: Any) -> dict[str, Any]:
+    """Serialize an explore destination to a dictionary."""
+    return {
+        "name": dest.name,
+        "country": dest.country,
+        "airport": dest.airport,
+        "price": dest.price,
+        "currency": dest.currency or CONFIG.default_currency,
+        "departure_date": dest.departure_date,
+        "return_date": dest.return_date,
+        "flight_duration_minutes": dest.duration_minutes,
+        "airline_code": dest.airline_code,
+        "airline_name": dest.airline_name,
+        "latitude": dest.latitude,
+        "longitude": dest.longitude,
+        "noteworthy": dest.noteworthy,
+        "subtitle": dest.subtitle,
     }
 
 
@@ -373,6 +429,77 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
         return {"success": False, "error": str(e), "dates": []}
     except Exception as e:
         return {"success": False, "error": f"Search failed: {str(e)}", "dates": []}
+
+
+def _execute_explore_search(params: ExploreParams) -> dict[str, Any]:
+    """Execute an explore (destinations-from-origin) search and format results."""
+    try:
+        origin = resolve_airport(params.origin)
+        cabin_class = parse_cabin_class(params.cabin_class)
+        max_stops = parse_max_stops(params.max_stops)
+
+        if params.return_date and not params.departure_date:
+            raise ParseError("return_date requires departure_date")
+
+        # Derive trip type and the from/to date pair the Explore wire format
+        # expects (both set or both None; one-way mirrors the departure date).
+        trip_duration = params.trip_duration
+        if params.departure_date and params.return_date:
+            trip_type = TripType.ROUND_TRIP
+            from_date, to_date = params.departure_date, params.return_date
+            if trip_duration is None:
+                days = (
+                    datetime.fromisoformat(params.return_date)
+                    - datetime.fromisoformat(params.departure_date)
+                ).days
+                trip_duration = days if days > 0 else None
+        elif params.departure_date:
+            trip_type = TripType.ONE_WAY
+            from_date = to_date = params.departure_date
+        else:
+            trip_type = TripType.ROUND_TRIP if trip_duration else TripType.ONE_WAY
+            from_date = to_date = None
+
+        filters = ExploreSearchFilters(
+            origin=[ExploreLocation.airport(origin)],
+            trip_type=trip_type,
+            passenger_info=PassengerInfo(adults=params.passengers),
+            stops=max_stops,
+            seat_type=cabin_class,
+            from_date=from_date,
+            to_date=to_date,
+            trip_duration=trip_duration,
+        )
+
+        destinations = SearchExplore().search(filters, currency=params.currency)
+
+        if not destinations:
+            return {
+                "success": True,
+                "destinations": [],
+                "count": 0,
+                "trip_type": trip_type.name,
+            }
+
+        if params.sort_by_price:
+            destinations.sort(key=lambda d: d.price if d.price is not None else float("inf"))
+
+        results = [_serialize_explore_destination(d) for d in destinations]
+
+        if CONFIG.max_results:
+            results = results[: CONFIG.max_results]
+
+        return {
+            "success": True,
+            "destinations": results,
+            "count": len(results),
+            "trip_type": trip_type.name,
+        }
+
+    except ParseError as e:
+        return {"success": False, "error": str(e), "destinations": []}
+    except Exception as e:
+        return {"success": False, "error": f"Search failed: {str(e)}", "destinations": []}
 
 
 # =============================================================================
@@ -547,6 +674,73 @@ def _search_dates_from_params(params: DateSearchParams) -> dict[str, Any]:
     return _execute_date_search(params)
 
 
+@mcp.tool(
+    annotations={
+        "title": "Explore Destinations",
+        "readOnlyHint": True,
+        "idempotentHint": True,
+    },
+)
+def explore_destinations(
+    origin: Annotated[str, Field(description="Departure airport IATA code (e.g., 'JFK')")],
+    departure_date: Annotated[
+        str | None,
+        Field(description="Outbound date in YYYY-MM-DD format (omit for flexible dates)"),
+    ] = None,
+    return_date: Annotated[
+        str | None,
+        Field(description="Return date in YYYY-MM-DD format (requires departure_date)"),
+    ] = None,
+    trip_duration: Annotated[
+        int | None,
+        Field(description="Trip length in days for flexible round-trip searches", ge=1),
+    ] = None,
+    cabin_class: Annotated[
+        str,
+        Field(description="Cabin class: ECONOMY, PREMIUM_ECONOMY, BUSINESS, FIRST"),
+    ] = CONFIG.default_cabin_class,
+    max_stops: Annotated[
+        str,
+        Field(description="Maximum stops: ANY, NON_STOP, ONE_STOP, TWO_PLUS_STOPS"),
+    ] = "ANY",
+    passengers: Annotated[
+        int | None,
+        Field(description="Number of adult passengers", ge=1),
+    ] = None,
+    currency: Annotated[
+        str | None,
+        Field(description="3-letter currency code for prices (e.g., 'EUR')"),
+    ] = None,
+    sort_by_price: Annotated[
+        bool,
+        Field(description="Sort destinations by price (lowest first)"),
+    ] = False,
+) -> dict[str, Any]:
+    """Discover the cheapest destinations reachable from an origin airport.
+
+    Answers "where can I fly cheaply from X?" — returns destinations with the
+    lowest prices Google Flights has indexed, with optional date constraints.
+    Use search_flights or search_dates once a destination is chosen.
+    """
+    params = ExploreParams(
+        origin=origin,
+        departure_date=departure_date,
+        return_date=return_date,
+        trip_duration=trip_duration,
+        cabin_class=cabin_class,
+        max_stops=max_stops,
+        passengers=passengers or CONFIG.default_passengers,
+        currency=currency,
+        sort_by_price=sort_by_price,
+    )
+    return _execute_explore_search(params)
+
+
+def _explore_from_params(params: ExploreParams) -> dict[str, Any]:
+    """Entry point for tests that call the tool via a params object."""
+    return _execute_explore_search(params)
+
+
 # =============================================================================
 # Prompts
 # =============================================================================
@@ -594,6 +788,31 @@ def find_budget_window_prompt(
         f"{origin.upper()} and {destination.upper()} for trips between "
         f"{travel_start} and {travel_end}. "
         f"Set trip_duration to {duration} days and sort the results by price."
+    )
+
+
+@mcp.prompt(
+    name="explore-cheap-destinations",
+    description="Discover the cheapest destinations reachable from an origin airport.",
+)
+def explore_cheap_destinations_prompt(
+    origin: str,
+    departure_date: str | None = None,
+    return_date: str | None = None,
+    duration: int | None = None,
+) -> str:
+    """Create a helper prompt to guide explore searches."""
+    when = (
+        f"departing {departure_date} and returning {return_date}"
+        if departure_date and return_date
+        else f"for a {duration}-day trip on flexible dates"
+        if duration
+        else "on flexible dates"
+    )
+    return (
+        "Use the `explore_destinations` tool to find the cheapest places to fly "
+        f"from {origin.upper()} {when}. Set sort_by_price to true and present the "
+        "ten most affordable destinations with their prices and travel dates."
     )
 
 
