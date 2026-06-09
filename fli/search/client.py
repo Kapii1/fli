@@ -15,7 +15,10 @@ Both share impersonation and header defaults.
 from __future__ import annotations
 
 import time as _time
+from queue import Empty as _QueueEmpty
+from queue import Queue as _Queue
 from threading import Lock as _Lock
+from threading import Thread as _Thread
 from typing import Any
 
 from curl_cffi import CurlHttpVersion, CurlOpt, requests
@@ -62,9 +65,7 @@ class _GoogleResolver:
                 return cls._ips
             for url in cls._DOH_URLS:
                 try:
-                    resp = requests.get(
-                        url, headers={"accept": "application/dns-json"}, timeout=3
-                    )
+                    resp = requests.get(url, headers={"accept": "application/dns-json"}, timeout=3)
                     answers = [
                         a
                         for a in resp.json().get("Answer", [])
@@ -169,15 +170,47 @@ class FastClient:
     has already POSTed to the Explore endpoint. Drop-in for :class:`Client`:
     exposes ``.post(url, **kwargs)``.
 
-    Not rate-limited or retried the same way — the only retry is a single
-    IP rotation on network-level stalls (timeouts, resolution failures).
-    Auth / 4xx errors fail fast.
+    Not rate-limited or retried the same way. Instead of waiting out the full
+    request timeout before retrying, :meth:`post` *hedges*: if no response has
+    arrived after :attr:`HEDGE_DELAY` seconds (or the in-flight attempt failed
+    on a network-level error), a duplicate request is fired on a fresh
+    DoH-resolved session bound to a rotated server IP, and the first response
+    to complete wins. Slow-serves and QUIC stalls are per-connection, so the
+    hedge typically answers in normal time (~1 s) instead of the 20 s the
+    stalled attempt would have burned. Auth / 4xx errors still fail fast.
     """
 
     # Google actively slow-serves throttled origins with ~22 s responses.
     # 20 s matches what _make_search_explore() used to set per-call;
     # setting it here covers SearchFlights and SearchExploreDetails too.
     REQUEST_TIMEOUT = 20
+
+    # Seconds without a completed response before a duplicate request is
+    # launched on a fresh session; re-arms every HEDGE_DELAY until
+    # MAX_ATTEMPTS is reached (hedges at ~3 s and ~6 s), since both in-flight
+    # connections occasionally get slow-served together. Healthy responses
+    # complete in 0.5–2 s, so only the slow tail ever hedges. Set to 0/None
+    # to disable hedging (degrades to fail-then-retry).
+    HEDGE_DELAY: float | None = 3.0
+
+    # Hard cap on sessions used per logical request (initial + replacements).
+    MAX_ATTEMPTS = 3
+
+    # Substrings of curl/curl_cffi error text that indicate a transport-level
+    # stall worth retrying on a fresh session. "quic" covers handshake stalls
+    # (curl 28 "QUIC needs at least ..."), which the old timeout-only match
+    # missed entirely.
+    _RETRIABLE_ERRORS = (
+        "timed out",
+        "timeout",
+        "could not resolve",
+        "connect",
+        "quic",
+        "reset",
+        "curl: (28)",
+        "curl: (55)",
+        "curl: (56)",
+    )
 
     def __init__(self):
         """Build a fresh DoH-resolved session."""
@@ -188,31 +221,89 @@ class FastClient:
         if hasattr(self, "_client"):
             self._client.close()
 
+    @classmethod
+    def _is_retriable(cls, exc: Exception) -> bool:
+        err = str(exc).lower()
+        return any(needle in err for needle in cls._RETRIABLE_ERRORS)
+
     def post(self, url: str, **kwargs: Any) -> requests.Response:
-        """POST with HTTP/3, retrying once against a rotated IP on stalls."""
+        """POST with HTTP/3, hedging onto a fresh session if the first stalls.
+
+        At most :attr:`MAX_ATTEMPTS` sessions are used and no new attempt is
+        launched once :attr:`REQUEST_TIMEOUT` has elapsed, so the worst case
+        is ``HEDGE_DELAY + REQUEST_TIMEOUT`` instead of the serial
+        ``2 × REQUEST_TIMEOUT`` of a fail-then-retry strategy.
+        """
         # chrome133a is already applied at the session level; a per-call
         # impersonate= kwarg overrides it and breaks H3 + keep-alive reuse.
         kwargs.pop("impersonate", None)
         kwargs.setdefault("http_version", CurlHttpVersion.V3)
         kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
 
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            sess = self._client if attempt == 0 else _make_resolved_session(_next_ip_index())
+        results: _Queue = _Queue()
+
+        def _run(sess: requests.Session, own_session: bool) -> None:
             try:
                 response = sess.post(url, **kwargs)
                 response.raise_for_status()
-                return response
+                results.put(("ok", response))
             except Exception as exc:
-                last_exc = exc
-                err = str(exc).lower()
-                retriable = (
-                    "timed out" in err or "timeout" in err or "could not resolve" in err
-                )
-                if attempt == 0 and retriable:
+                results.put(("err", exc))
+            finally:
+                # Replacement sessions are created per-attempt; the response
+                # body is fully buffered (stream=False), so closing here is
+                # safe even when this attempt won the race.
+                if own_session:
+                    sess.close()
+
+        def _spawn(sess: requests.Session, own_session: bool) -> None:
+            _Thread(target=_run, args=(sess, own_session), daemon=True).start()
+
+        started_at = _time.monotonic()
+
+        def _may_spawn(attempts: int) -> bool:
+            # Never extend the tail: once the original timeout budget is
+            # spent, stop launching replacements and drain what's in flight.
+            return (
+                attempts < self.MAX_ATTEMPTS and _time.monotonic() - started_at < kwargs["timeout"]
+            )
+
+        _spawn(self._client, False)
+        attempts = 1
+        in_flight = 1
+        last_exc: Exception | None = None
+
+        while True:
+            # Hedge timer: arm only while every attempt so far is still
+            # silently in flight (a failure switches us to the replacement
+            # logic below) and the attempt/time budgets allow another one.
+            may_hedge = bool(self.HEDGE_DELAY) and last_exc is None and _may_spawn(attempts)
+            try:
+                kind, payload = results.get(timeout=self.HEDGE_DELAY if may_hedge else None)
+            except _QueueEmpty:
+                # No response within HEDGE_DELAY: race another duplicate on a
+                # fresh session against the (probably slow-served) attempts.
+                # Both in-flight connections being slow-served at once does
+                # happen, so the timer keeps re-arming until MAX_ATTEMPTS.
+                _spawn(_make_resolved_session(_next_ip_index()), True)
+                attempts += 1
+                in_flight += 1
+                continue
+
+            if kind == "ok":
+                return payload
+
+            in_flight -= 1
+            last_exc = payload
+            if in_flight == 0:
+                if self._is_retriable(payload) and _may_spawn(attempts):
+                    _spawn(_make_resolved_session(_next_ip_index()), True)
+                    attempts += 1
+                    in_flight += 1
                     continue
-                raise Exception(f"POST request failed: {exc}") from exc
-        raise Exception(f"POST request failed after retry: {last_exc}")
+                raise Exception(f"POST request failed: {last_exc}") from last_exc
+            # Another attempt is still in flight — wait for it instead of
+            # piling on more connections.
 
 
 def get_client() -> Client:
