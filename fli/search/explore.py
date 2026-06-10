@@ -180,7 +180,7 @@ class GetExploreDestinations:
         # Specific-date format: record[1] is [[null, price], booking_token]
         if isinstance(r1, list) and r1 and isinstance(r1[0], list):
             price_block = r1[0]
-            price = SearchExplore._num(price_block, 1)
+            price = GetExploreDestinations._num(price_block, 1)
             booking_token = r1[1] if len(r1) > 1 and isinstance(r1[1], str) else None
             currency = extract_currency_from_price_token(booking_token)
             dest_info = record[6] if len(record) > 6 and isinstance(record[6], list) else []
@@ -234,8 +234,8 @@ class GetExploreDestinations:
         name = record[2]
         if not isinstance(name, str):
             return None
-        latitude = SearchExplore._num(r1, 0) if isinstance(r1, list) else None
-        longitude = SearchExplore._num(r1, 1) if isinstance(r1, list) else None
+        latitude = GetExploreDestinations._num(r1, 0) if isinstance(r1, list) else None
+        longitude = GetExploreDestinations._num(r1, 1) if isinstance(r1, list) else None
         return ExploreDestination(
             kg_id=kg_id,
             name=name,
@@ -245,8 +245,8 @@ class GetExploreDestinations:
             longitude=longitude,
             departure_date=record[11] if len(record) > 11 and isinstance(record[11], str) else None,
             return_date=record[12] if len(record) > 12 and isinstance(record[12], str) else None,
-            price=SearchExplore._num(record, 16),
-            duration_minutes=SearchExplore._num(record, 17),
+            price=GetExploreDestinations._num(record, 16),
+            duration_minutes=GetExploreDestinations._num(record, 17),
             thumbnail_url=record[3] if len(record) > 3 and isinstance(record[3], str) else None,
             # [20] is `noteworthy` per the F0d decoder. The old parser also
             # mirrored it into is_domestic, which was wrong — domesticity is
@@ -348,7 +348,7 @@ class GetExploreDestinations:
         if dest.price is None and len(record) > 15 and isinstance(record[15], list) and record[15]:
             pair = record[15][0]
             if isinstance(pair, list):
-                display_price = SearchExplore._num(pair, 1)
+                display_price = GetExploreDestinations._num(pair, 1)
                 if display_price is not None and display_price > 0:
                     dest.price = display_price
 
@@ -370,7 +370,7 @@ class GetExploreDestinations:
             if airline_name and not dest.airline_name:
                 dest.airline_name = airline_name
             # v0d[3] = outbound flight duration in minutes (0 on ground routes).
-            duration = SearchExplore._num(detail, 3)
+            duration = GetExploreDestinations._num(detail, 3)
             if duration is not None and duration > 0 and dest.duration_minutes is None:
                 dest.duration_minutes = duration
 
@@ -573,3 +573,9 @@ class SearchExploreDetails:
             destination_airport_name=_str(10),
             origin_city_kg_id=_str(13),
         )
+
+
+# Backwards-compatible alias: the class was renamed to GetExploreDestinations
+# (matching the Google endpoint name); downstream callers still import
+# SearchExplore.
+SearchExplore = GetExploreDestinations
