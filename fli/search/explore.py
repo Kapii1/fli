@@ -23,7 +23,7 @@ from fli.models.google_flights.explore import (
 from fli.search.client import get_fast_client
 
 
-class SearchExplore:
+class GetExploreDestinations:
     """Search for cheap destinations from one or more origins."""
 
     BASE_URL = (
