@@ -8,6 +8,7 @@ from typer import BadParameter
 
 from fli.cli.enums import DayOfWeek
 from fli.cli.utils import (
+    build_json_success_response,
     display_date_results,
     display_flight_results,
     filter_dates_by_days,
@@ -20,8 +21,7 @@ from fli.cli.utils import (
     validate_date,
     validate_time_range,
 )
-from fli.models import Airline, Airport, FlightLeg, FlightResult, MaxStops
-from fli.models.google_flights.base import TripType
+from fli.models import Airline, Airport, FlightLeg, FlightResult, MaxStops, TripType
 from fli.search.dates import DatePrice
 
 
@@ -236,12 +236,12 @@ def _make_flight_result(
     )
 
 
-def _capture_display(flights: list) -> str:
+def _capture_display(flights: list, trip_type: TripType = TripType.ONE_WAY) -> str:
     """Run display_flight_results and capture the rendered text."""
     buf = StringIO()
     test_console = Console(file=buf, width=120, force_terminal=True)
     with patch("fli.cli.utils.console", test_console):
-        display_flight_results(flights)
+        display_flight_results(flights, trip_type=trip_type)
     return buf.getvalue()
 
 
@@ -277,7 +277,7 @@ def test_display_multi_city_three_legs():
     leg2 = _make_flight_result(price=0.0, flight_number="DL200")
     leg3 = _make_flight_result(price=800.0, flight_number="UA300")
 
-    output = _capture_display([(leg1, leg2, leg3)])
+    output = _capture_display([(leg1, leg2, leg3)], trip_type=TripType.MULTI_CITY)
 
     assert "$800.00" in output
     assert "Multi-city Flight" in output
@@ -295,6 +295,46 @@ def test_display_round_trip_price_asymmetric():
 
     assert "$400.00" in output
     assert "$750.00" not in output
+
+
+def test_display_flight_results_shows_booking_url_footer():
+    """A booking_url is rendered as a clickable footer below the options."""
+    buf = StringIO()
+    test_console = Console(file=buf, width=120, force_terminal=True)
+    url = "https://www.google.com/travel/flights?q=Flights%20from%20JFK%20to%20LHR"
+    with patch("fli.cli.utils.console", test_console):
+        display_flight_results(
+            [_make_flight_result(price=159.0)],
+            trip_type=TripType.ONE_WAY,
+            booking_url=url,
+        )
+    output = buf.getvalue()
+    assert "Open on Google Flights" in output
+    assert "travel/flights" in output
+
+
+def test_display_flight_results_no_footer_without_booking_url():
+    """No booking footer is shown when booking_url is omitted."""
+    output = _capture_display([_make_flight_result(price=159.0)])
+    assert "Open on Google Flights" not in output
+
+
+def test_display_date_results_links_dates_when_route_given():
+    """Departure dates become Google Flights hyperlinks when a route is supplied."""
+    buf = StringIO()
+    test_console = Console(file=buf, width=120, force_terminal=True)
+    dates = [DatePrice(date=(datetime(2026, 7, 15),), price=299.0, currency="USD")]
+    with patch("fli.cli.utils.console", test_console):
+        display_date_results(
+            dates,
+            TripType.ONE_WAY,
+            origin="JFK",
+            destination="LHR",
+            currency="USD",
+        )
+    output = buf.getvalue()
+    # Rich emits OSC-8 hyperlink escape sequences carrying the URL on a terminal.
+    assert "travel/flights" in output
 
 
 def test_display_one_way_price_uses_returned_currency():
@@ -399,6 +439,76 @@ def test_serialize_date_result_round_trip():
     }
 
 
+def test_serialize_date_result_no_booking_url_without_route():
+    """Without origin/destination, no booking_url is added (back-compat shape)."""
+    result = DatePrice(date=(datetime(2026, 5, 1),), price=199.0)
+
+    payload = serialize_date_result(result, TripType.ONE_WAY)
+
+    assert "booking_url" not in payload
+
+
+def test_serialize_date_result_includes_booking_url_one_way():
+    """A route yields a per-date Google Flights deep link for one-way searches."""
+    result = DatePrice(date=(datetime(2026, 5, 1),), price=199.0)
+
+    payload = serialize_date_result(
+        result,
+        TripType.ONE_WAY,
+        origin="JFK",
+        destination="LHR",
+        currency="USD",
+    )
+
+    url = payload["booking_url"]
+    assert url.startswith("https://www.google.com/travel/flights?q=")
+    assert "JFK" in url
+    assert "LHR" in url
+    assert "2026-05-01" in url
+
+
+def test_serialize_date_result_booking_url_round_trip_has_return():
+    """Round-trip date links embed the return date too."""
+    result = DatePrice(date=(datetime(2026, 5, 1), datetime(2026, 5, 8)), price=599.0)
+
+    payload = serialize_date_result(
+        result,
+        TripType.ROUND_TRIP,
+        origin="JFK",
+        destination="LHR",
+    )
+
+    assert "2026-05-01" in payload["booking_url"]
+    assert "2026-05-08" in payload["booking_url"]
+
+
+def test_build_json_success_response_includes_booking_url():
+    """booking_url is added to the success payload when provided."""
+    payload = build_json_success_response(
+        search_type="flights",
+        trip_type=TripType.ONE_WAY,
+        query={},
+        results_key="flights",
+        results=[],
+        booking_url="https://www.google.com/travel/flights?q=x",
+    )
+
+    assert payload["booking_url"] == "https://www.google.com/travel/flights?q=x"
+
+
+def test_build_json_success_response_omits_booking_url_when_none():
+    """No booking_url key when not provided."""
+    payload = build_json_success_response(
+        search_type="flights",
+        trip_type=TripType.ONE_WAY,
+        query={},
+        results_key="flights",
+        results=[],
+    )
+
+    assert "booking_url" not in payload
+
+
 def test_serialize_flight_result_uses_returned_currency():
     """JSON flight serialization should preserve the parsed result currency."""
     flight = _make_flight_result(price=159.0, currency="SEK")
@@ -469,3 +579,12 @@ def test_serialize_flight_result_extracted_currency_takes_precedence():
     payload = serialize_flight_result(flight, default_currency="CAD")
 
     assert payload["currency"] == "GBP"
+
+
+def test_format_airport_does_not_repeat_the_disambiguation_code():
+    """Disambiguated names (e.g. "Naha Airport (OKA)") must not render the code twice."""
+    from fli.cli.utils import format_airport
+    from fli.models import Airport
+
+    assert format_airport(Airport.OKA) == "OKA (Naha Airport)"
+    assert format_airport(Airport.JFK).startswith("JFK (John F Kennedy")

@@ -1,0 +1,615 @@
+"""Pure response decoders for Google Flights' RPC payloads.
+
+These functions take the already-deserialised inner-JSON value of a
+``wrb.fr`` chunk (see :mod:`fli.search._wire`) and produce typed model
+objects. They are intentionally I/O free so they can be exercised
+deterministically against captured fixtures and from unit tests.
+
+Position layouts live in ``.reverse-eng/notes/response_map.md`` (the
+overall flight row) and ``.reverse-eng/notes/booking_results.md`` (the
+booking-option row).
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Any
+
+from fli.core import extract_currency_from_price_token
+from fli.models import (
+    Airline,
+    Airport,
+    Amenities,
+    BookingOption,
+    FlightLeg,
+    FlightResult,
+    Layover,
+    SeatType,
+)
+from fli.search._helpers import as_bool, as_int, as_non_negative_int, as_str, safe_get
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Flight result decoding
+# ---------------------------------------------------------------------------
+
+
+def parse_flight_row(row: list) -> FlightResult:
+    """Decode a single flight row into a structured :class:`FlightResult`.
+
+    Raises :class:`ValueError` / :class:`KeyError` / :class:`AttributeError`
+    when the row is malformed; callers should treat those as "skip this row"
+    rather than a hard failure (Google occasionally returns half-populated
+    rows for advert / sponsor placements).
+    """
+    detail = row[0]
+    price, currency = _parse_price_info(row)
+
+    raw_legs = detail[2] or []
+    legs = [_parse_leg(fl) for fl in raw_legs]
+    layovers = _derive_layovers(legs, safe_get(detail, 13)) if len(legs) > 1 else None
+
+    emissions = _parse_emissions(detail)
+    primary_airline = _safe_airline(safe_get(detail, 0))
+    primary_airline_name = None
+    names_field = safe_get(detail, 1)
+    if isinstance(names_field, list) and names_field:
+        first = names_field[0]
+        if isinstance(first, str):
+            primary_airline_name = first
+
+    return FlightResult(
+        price=price,
+        currency=currency,
+        duration=detail[9],
+        stops=max(len(legs) - 1, 0),
+        legs=legs,
+        layovers=layovers or None,
+        co2_emissions_g=emissions["this_g"],
+        co2_emissions_typical_g=emissions["typical_g"],
+        co2_emissions_delta_pct=emissions["delta_pct"],
+        emissions_tag=emissions["tag"],
+        self_transfer=as_bool(safe_get(detail, 12)),
+        mixed_cabin=as_bool(safe_get(row, 10)),
+        primary_airline=primary_airline,
+        primary_airline_name=primary_airline_name,
+        booking_token=as_str(safe_get(row, 8)),
+    )
+
+
+def _parse_leg(fl: list) -> FlightLeg:
+    airline_info = fl[22] or []
+    airline = _safe_airline(safe_get(airline_info, 0))
+    flight_number = as_str(safe_get(airline_info, 1)) or ""
+    op_code = safe_get(airline_info, 2)
+    operating_airline = _safe_airline(op_code) if op_code else None
+
+    aircraft = as_str(safe_get(fl, 17))
+    legroom_short = as_str(safe_get(fl, 14))
+    legroom_long = as_str(safe_get(fl, 30))
+    amenities = _parse_amenities(safe_get(fl, 12), safe_get(fl, 13), legroom_short or legroom_long)
+    overnight = as_bool(safe_get(fl, 19)) or False
+    co2_emissions_g = as_non_negative_int(safe_get(fl, 31))
+    cabin = _parse_cabin(safe_get(fl, 16))
+
+    return FlightLeg(
+        airline=airline,
+        flight_number=flight_number,
+        departure_airport=_parse_airport(fl[3]),
+        arrival_airport=_parse_airport(fl[6]),
+        departure_datetime=_parse_datetime(fl[20], fl[8]),
+        arrival_datetime=_parse_datetime(fl[21], fl[10]),
+        duration=fl[11],
+        departure_airport_name=as_str(safe_get(fl, 4)),
+        arrival_airport_name=as_str(safe_get(fl, 5)),
+        operating_airline=operating_airline,
+        operating_flight_number=None,
+        aircraft=aircraft,
+        legroom_short=legroom_short,
+        legroom=legroom_long or legroom_short,
+        amenities=amenities,
+        overnight=overnight,
+        co2_emissions_g=co2_emissions_g,
+        cabin=cabin,
+    )
+
+
+def _parse_cabin(code: Any) -> SeatType | None:
+    """Decode the per-leg cabin code at ``leg[16]`` into a :class:`SeatType`.
+
+    Google uses the same 1..4 numbering here as in the request filters
+    (1 economy, 2 premium economy, 3 business, 4 first). Unknown codes
+    return None rather than raising — the leg is still usable.
+    """
+    value = as_non_negative_int(code)
+    if value is None:
+        return None
+    try:
+        return SeatType(value)
+    except ValueError:
+        logger.debug("Unknown cabin code %r at leg[16]", value)
+        return None
+
+
+# --- leg[12] amenity slot map (issue #217) --------------------------------
+#
+# ``leg[12]`` is a sparse array of amenity flags, trailing nulls trimmed.
+# Two mutually-exclusive groups plus a Wi-Fi tier code were confirmed by
+# tabulating all 481 leg instances across the captured fixtures (plus
+# three live public-page captures) against published fleet facts:
+#
+#   slots 1..6  power group — exactly one is ever set on a leg.
+#   slots 8..10 video group — exactly one is ever set on a leg.
+#   slot 11     Wi-Fi tier code (an int, never a bool).
+#
+# Slots 2, 4 and 6 are reported to be "some seats only" variants of 1, 3
+# and 5, and slot 11 == 1 is reported to mean "Wi-Fi, tier unknown", but
+# none of those values occurs anywhere in the corpus. Nothing is inferred
+# from them: an unobserved slot yields None, never a guessed value.
+#
+# No slot in the corpus ever holds JSON ``false``, so every ``False`` this
+# decoder emits is an inference. Only one is made — see
+# ``in_seat_video`` in :func:`_parse_amenities`.
+
+#: Power slots whose flavour is confirmed.
+_POWER_SLOTS: dict[int, str] = {1: "plug_and_usb", 3: "plug", 5: "usb"}
+#: Every index in the power group, scanned in wire order. Includes the
+#: unobserved 2/4/6 "some seats" variants deliberately: the first *set*
+#: slot wins even when it is one we cannot label, so a payload that ever
+#: does set one yields "unknown" rather than skipping ahead to a slot we
+#: can name and reporting something Google did not say.
+_POWER_GROUP: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
+#: Video slots, in wire order (first match wins).
+_VIDEO_SLOTS: dict[int, str] = {8: "live_tv", 9: "on_demand", 10: "stream_to_device"}
+#: Video products delivered on a seatback screen rather than to a phone.
+_SEATBACK_VIDEO = frozenset({"live_tv", "on_demand"})
+#: Position of the Wi-Fi tier code within ``leg[12]``.
+_WIFI_TIER_SLOT = 11
+#: Confirmed Wi-Fi tier codes.
+_WIFI_TIERS: dict[int, str] = {2: "free", 3: "paid"}
+#: Confirmed ``leg[13]`` seat-quality codes. Code 9 ("angled flat") is
+#: reported but unobserved, so it deliberately has no label here.
+_SEAT_QUALITY: dict[int, str] = {
+    1: "average",
+    2: "below_average",
+    3: "above_average",
+    4: "extra_reclining",
+    5: "lie_flat",
+    6: "lie_flat_suite_with_door",
+    8: "recliner",
+}
+
+
+def _slot_on(slots: Any, index: int) -> bool:
+    """Return True when ``slots[index]`` is a set flag.
+
+    Google's RPC payload encodes these flags as JSON booleans while the
+    public travel page encodes the same fields as ``1``; accept both and
+    treat every other value (including ``0`` and strings) as unset.
+    """
+    value = safe_get(slots, index)
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, int) and value > 0
+
+
+def _first_slot(slots: Any, indexes: Any) -> int | None:
+    """Return the first index in ``indexes`` whose slot is set, else None."""
+    return next((i for i in indexes if _slot_on(slots, i)), None)
+
+
+def _parse_legroom_inches(*legroom_strings: Any) -> int | None:
+    """Pull the integer seat pitch out of ``"31 in"`` / ``"31 inches"``.
+
+    ``str.isdigit()`` alone is not a safe guard: it is True for
+    superscripts like ``"²"``, which ``int()`` then rejects with a
+    ValueError. This runs inside :func:`_parse_leg`, so that exception
+    would propagate out of :func:`parse_flight_row` and silently drop the
+    entire flight row. Restrict to plain ASCII digits, which also keeps
+    this identical to the TypeScript port's ASCII-only regex.
+    """
+    for text in legroom_strings:
+        if not isinstance(text, str):
+            continue
+        head = text.split(" ", 1)[0]
+        if head.isascii() and head.isdigit():
+            inches = int(head)
+            if inches > 0:
+                return inches
+    return None
+
+
+def _parse_amenities(slots: Any, seat_quality: Any = None, legroom: Any = None) -> Amenities | None:
+    """Decode amenities at ``leg[12]``, seat quality at ``leg[13]``, pitch at ``leg[14]``.
+
+    ``leg[12][11]`` is the Wi-Fi tier, not a legroom rating, and slot 1 is
+    a power flag rather than Wi-Fi — see ``_POWER_SLOTS`` above. Seat
+    quality and legroom may be present even when the amenities array is
+    missing.
+
+    Return None when no source carries a usable value.
+    """
+    # Only a slot whose meaning the corpus confirms may set ``power``; an
+    # unlabelled slot (2/4/6, never observed) leaves every power field
+    # unknown rather than asserting "there is power, flavour unknown".
+    power_slot = _first_slot(slots, _POWER_GROUP)
+    power_type = _POWER_SLOTS.get(power_slot) if power_slot is not None else None
+    power = True if power_type is not None else None
+    # ``power_type == "plug"`` is the AC-outlet-only variant, but it rests
+    # on 7 legs from 2 carriers in the whole corpus — far too thin to put
+    # a False on a public tri-state. The distinction survives losslessly
+    # in ``power_type``; ``usb_power`` only ever says True or "unknown".
+    usb_power = True if power_type in ("plug_and_usb", "usb") else None
+
+    video_slot = _first_slot(slots, _VIDEO_SLOTS)
+    video_type = _VIDEO_SLOTS.get(video_slot) if video_slot is not None else None
+    # INFERENCE: "stream to your own device" is Google's way of saying the
+    # aircraft has no seatback screen — true of every slot-10 fleet in the
+    # corpus (Alaska, AA 737/A321 Sharklets, every regional jet) — so it
+    # is the one negative these slots license. Nothing else is inferred:
+    # a live-TV seatback normally carries on-demand content too, and
+    # streamed content is itself on-demand, so the absence of slot 9 is
+    # not evidence that on-demand is unavailable.
+    in_seat_video = None if video_type is None else video_type in _SEATBACK_VIDEO
+    on_demand_video = True if video_type == "on_demand" else None
+
+    wifi_code = as_non_negative_int(safe_get(slots, _WIFI_TIER_SLOT))
+    wifi = True if wifi_code else None
+    wifi_tier = _WIFI_TIERS.get(wifi_code) if wifi_code else None
+
+    legroom_rating = as_non_negative_int(seat_quality)
+    seat_quality_label = _SEAT_QUALITY.get(legroom_rating) if legroom_rating is not None else None
+    # ``legroom_inches`` is derived from a string the leg already exposes
+    # as ``legroom``/``legroom_short``, so on its own it is not enough to
+    # materialise an Amenities object — that keeps "no amenities" meaning
+    # the same thing it did before this decoder was corrected.
+    if wifi is None and power is None and video_type is None and legroom_rating is None:
+        return None
+    legroom_inches = _parse_legroom_inches(legroom)
+    return Amenities(
+        wifi=wifi,
+        power=power,
+        usb_power=usb_power,
+        in_seat_video=in_seat_video,
+        on_demand_video=on_demand_video,
+        legroom_rating=legroom_rating,
+        wifi_tier=wifi_tier,
+        power_type=power_type,
+        video_type=video_type,
+        seat_quality=seat_quality_label,
+        legroom_inches=legroom_inches,
+    )
+
+
+def _parse_emissions(detail: list) -> dict[str, Any]:
+    """Extract the four emissions metrics from ``detail[22]``."""
+    emissions_block = safe_get(detail, 22)
+    out: dict[str, Any] = {
+        "this_g": None,
+        "typical_g": None,
+        "delta_pct": None,
+        "tag": None,
+    }
+    if not isinstance(emissions_block, list):
+        return out
+    out["this_g"] = as_non_negative_int(safe_get(emissions_block, 7))
+    out["typical_g"] = as_non_negative_int(safe_get(emissions_block, 8))
+    out["delta_pct"] = as_int(safe_get(emissions_block, 3))
+    tag_int = as_int(safe_get(emissions_block, 11))
+    if tag_int in (1, 2, 3):
+        out["tag"] = {1: "lower", 2: "typical", 3: "higher"}[tag_int]
+    return out
+
+
+def _derive_layovers(
+    legs: list[FlightLeg],
+    detail_block: Any = None,
+) -> list[Layover]:
+    """Compute layovers from consecutive leg timestamps.
+
+    Durations / overnight / change-of-airport are recomputed from the
+    parsed leg datetimes for internal consistency. When Google's
+    ``detail[13]`` block is provided it carries airport name + city for
+    each layover; those fields are merged in but never override the
+    structurally-derived numbers.
+
+    Shape of ``detail[13]`` (per layover entry, indices used here):
+    ``[duration_mins, IATA, IATA, None, airport_name, city, ...]``
+    """
+    detail_entries: list = detail_block if isinstance(detail_block, list) else []
+    layovers: list[Layover] = []
+    for i in range(len(legs) - 1):
+        prev = legs[i]
+        nxt = legs[i + 1]
+        wait_seconds = (nxt.departure_datetime - prev.arrival_datetime).total_seconds()
+        delta_minutes = max(int(wait_seconds // 60), 0)
+
+        airport_name: str | None = None
+        city: str | None = None
+        entry = detail_entries[i] if i < len(detail_entries) else None
+        if isinstance(entry, list):
+            airport_name = as_str(safe_get(entry, 4))
+            city = as_str(safe_get(entry, 5))
+
+        layovers.append(
+            Layover(
+                airport=prev.arrival_airport,
+                duration=delta_minutes,
+                overnight=prev.arrival_datetime.date() != nxt.departure_datetime.date(),
+                change_of_airport=prev.arrival_airport != nxt.departure_airport,
+                airport_name=airport_name,
+                city=city,
+            )
+        )
+    return layovers
+
+
+def _parse_price_info(row: list) -> tuple[float | None, str | None]:
+    """Extract numeric price + ISO currency code from the price block.
+
+    Returns ``(None, currency)`` when the price head is an empty list
+    (``[[], "<token>"]``) — Google's signal that it has not pre-computed
+    a shopping-list price for this row. This happens routinely for
+    premium-cabin round-trip itineraries, especially with multi-passenger
+    configs (e.g. ``adults=2, children=1, seat_type=BUSINESS,
+    trip_type=ROUND_TRIP``): Google declines to surface an aggregate
+    "from $X" price and expects the user to drill into a specific
+    outbound+return pair, then call ``GetBookingResults`` for real fares.
+    The per-row booking token at ``row[8]`` is still populated, so
+    callers can resolve real prices via
+    :meth:`SearchFlights.get_booking_options`.
+
+    Raises ``ValueError`` when the price block is genuinely malformed
+    (non-numeric, wrong shape). Callers in :func:`parse_flight_row` will
+    catch this and skip the row rather than ship a misleading ``$0.00``
+    flight. Truly missing price blocks (sponsor placements with no
+    ``row[1]``) trigger this too.
+    """
+    price_block = _get_price_block(row)
+    if price_block is None:
+        raise ValueError("price block missing — skip row")
+
+    try:
+        head = price_block[0]
+        if not isinstance(head, list):
+            raise ValueError("price head is not a list")
+        if not head:
+            # Empty head ([]) is Google's "no shopping-list price"
+            # marker, not a malformed row. Surface the itinerary with
+            # price=None so the caller can drill into GetBookingResults.
+            price: float | None = None
+        else:
+            raw_price = head[-1]
+            if isinstance(raw_price, bool) or not isinstance(raw_price, int | float):
+                raise ValueError(f"price field is not numeric: {raw_price!r}")
+            price = float(raw_price)
+    except (IndexError, TypeError) as e:
+        raise ValueError(f"malformed price block: {e}") from e
+
+    currency: str | None = None
+    if len(price_block) > 1:
+        try:
+            currency = extract_currency_from_price_token(price_block[1])
+        except (IndexError, TypeError, ValueError) as e:
+            # Currency is optional metadata; failure here is not fatal.
+            logger.debug("Currency token decode failed: %s", e)
+    return price, currency
+
+
+def _get_price_block(row: list) -> list | None:
+    """Return the price block (``row[1]``) when it has the expected shape."""
+    block = safe_get(row, 1)
+    return block if isinstance(block, list) else None
+
+
+def _parse_datetime(date_arr: list[int], time_arr: list[int]) -> datetime:
+    """Convert ``[y,m,d]`` + ``[h,m]`` arrays into a ``datetime``."""
+    if not any(x is not None for x in date_arr) or not any(x is not None for x in time_arr):
+        raise ValueError("Date and time arrays must contain at least one non-None value")
+    return datetime(*(x or 0 for x in date_arr), *(x or 0 for x in time_arr))
+
+
+# Airline / Airport enums are immutable so each code maps to a single
+# member instance — cache the ``getattr`` walk so the parse hot path
+# turns into a dict lookup. Built from ``__members__`` (not ``for m in
+# Airline``/``for m in Airport``) so every registered name resolves, even
+# an alias: iterating the Enum itself silently skips alias members (two
+# codes sharing the same human-readable name collapse into one Enum
+# value), which used to make codes like Okinawa's ``OKA`` disappear from
+# this dict entirely and get dropped as "unknown code". The generator now
+# disambiguates duplicate names so aliases shouldn't occur in practice,
+# but building from ``__members__`` keeps this dict correct even if that
+# invariant is ever violated.
+_AIRLINE_BY_CODE: dict[str, Airline] = dict(Airline.__members__)
+_AIRPORT_BY_CODE: dict[str, Airport] = dict(Airport.__members__)
+
+
+def _parse_airline(code: str) -> Airline:
+    """Convert an airline IATA code into an :class:`Airline` enum value."""
+    if code and code[0].isdigit():
+        code = f"_{code}"
+    try:
+        return _AIRLINE_BY_CODE[code]
+    except KeyError as e:
+        raise AttributeError(code) from e
+
+
+def _safe_airline(code: Any) -> Airline | None:
+    """Parse an airline code defensively; return None on missing/invalid.
+
+    A code that *is* a non-empty string but doesn't resolve to a known
+    ``Airline`` enum value triggers a warning — it usually signals that
+    Google has added a new IATA code we haven't catalogued yet. Known
+    sentinels like ``"multi"`` (Google's codeshare placeholder) are
+    accepted silently.
+    """
+    if not isinstance(code, str) or not code:
+        return None
+    if code in _AIRLINE_SENTINELS:
+        return None
+    try:
+        return _parse_airline(code)
+    except (AttributeError, IndexError):
+        logger.warning(
+            "Unknown airline IATA code %r — add to fli.models.Airline enum",
+            code,
+        )
+        return None
+
+
+# Pseudo-codes Google emits in place of a real IATA carrier identifier.
+# Treat as "no single primary airline" rather than warning per row.
+_AIRLINE_SENTINELS = frozenset({"multi"})
+
+
+def _parse_airport(code: str) -> Airport:
+    """Convert an airport IATA code into an :class:`Airport` enum value.
+
+    Raises ``AttributeError`` for unknown codes — the caller in
+    :func:`parse_flight_row` treats that as a "skip this row" signal,
+    but we log a warning here so new airports surface in operator logs
+    rather than vanishing silently from search results.
+    """
+    try:
+        return _AIRPORT_BY_CODE[code]
+    except KeyError as e:
+        logger.warning(
+            "Unknown airport IATA code %r — add to fli.models.Airport enum",
+            code,
+        )
+        raise AttributeError(code) from e
+
+
+# ---------------------------------------------------------------------------
+# Booking option decoding
+# ---------------------------------------------------------------------------
+
+
+def parse_booking_chunk(chunk: Any) -> list[BookingOption]:
+    """Walk a decoded ``wrb.fr`` chunk and yield every booking-option row."""
+    options: list[BookingOption] = []
+    _walk_for_booking_rows(chunk, options)
+    return options
+
+
+def _walk_for_booking_rows(node: Any, out: list[BookingOption]) -> None:
+    """Recurse into ``node`` looking for booking-row-shaped lists."""
+    if isinstance(node, list):
+        opt = _try_parse_booking_row(node)
+        if opt is not None:
+            out.append(opt)
+            return
+        for child in node:
+            _walk_for_booking_rows(child, out)
+
+
+def _try_parse_booking_row(row: list) -> BookingOption | None:
+    """Parse a booking row using positional indices.
+
+    Positions verified from a live GetBookingResults capture (May 2026):
+
+    - [0]: int index
+    - [1]: vendor list ``[[code, name, ?, is_airline_direct]]``
+    - [3]: flight list ``[[airline_code, flight_no], ...]``
+    - [5]: URL block ``[vendor_url, None, [google_click_url, ...]]``
+    - [7]: price block ``[[None, price], currency_token]`` (same shape as
+      the flight-result price block — the same currency decoder works)
+    - [14]: fare-code wrapper ``[[[None, [airline, FARE_CODE], 1]]]``
+    - [21][3]: human-readable fare name
+
+    Returns None when the shape doesn't match — false positives are
+    unwanted because we walk every nested list looking for these rows.
+    """
+    if not isinstance(row, list) or len(row) < 8:
+        return None
+    if not isinstance(row[0], int):
+        return None
+
+    vendor_block = row[1]
+    if not (isinstance(vendor_block, list) and vendor_block):
+        return None
+    first_vendor = vendor_block[0]
+    if not (
+        isinstance(first_vendor, list)
+        and len(first_vendor) >= 2
+        and isinstance(first_vendor[0], str)
+        and isinstance(first_vendor[1], str)
+    ):
+        return None
+    is_direct = (
+        first_vendor[3] if len(first_vendor) >= 4 and isinstance(first_vendor[3], bool) else False
+    )
+
+    flights: list[tuple[str, str]] | None = None
+    if isinstance(row[3], list):
+        gathered: list[tuple[str, str]] = [
+            (entry[0], entry[1])
+            for entry in row[3]
+            if isinstance(entry, list)
+            and len(entry) >= 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], str)
+        ]
+        if not gathered and row[3]:
+            # row[3] was a non-empty list but no entry matched the shape —
+            # likely a wire-format change. Log so the next debug session
+            # has a breadcrumb; the booking option still parses with
+            # ``flights=None`` (the model treats that as "unknown").
+            logger.debug("Booking row[3] had %d entries but none matched shape", len(row[3]))
+        flights = gathered or None
+
+    booking_url, google_click_url = _extract_booking_urls(row[5])
+
+    price: float | None = None
+    currency: str | None = None
+    if isinstance(row[7], list):
+        pblock = row[7]
+        if pblock and isinstance(pblock[0], list) and len(pblock[0]) >= 2:
+            raw_price = pblock[0][-1]
+            if isinstance(raw_price, int | float) and not isinstance(raw_price, bool):
+                price = float(raw_price)
+        if len(pblock) > 1 and isinstance(pblock[1], str):
+            currency = extract_currency_from_price_token(pblock[1])
+
+    return BookingOption(
+        vendor_code=first_vendor[0],
+        vendor_name=first_vendor[1],
+        is_airline_direct=is_direct,
+        price=price,
+        currency=currency,
+        fare_name=_extract_fare_name(row),
+        booking_url=booking_url,
+        google_click_url=google_click_url,
+        flights=flights,
+    )
+
+
+def _extract_booking_urls(block: Any) -> tuple[str | None, str | None]:
+    if not isinstance(block, list):
+        return None, None
+    vendor_url = block[0] if block and isinstance(block[0], str) else None
+    google_click_url: str | None = None
+    if len(block) > 2 and isinstance(block[2], list) and block[2]:
+        candidate = block[2][0]
+        if isinstance(candidate, str) and "/travel/clk" in candidate:
+            google_click_url = candidate
+    return vendor_url, google_click_url
+
+
+def _extract_fare_name(row: list) -> str | None:
+    """Prefer the human-readable name at ``row[21][3]``; fall back to row[14]."""
+    if len(row) > 21 and isinstance(row[21], list) and len(row[21]) > 3:
+        candidate = row[21][3]
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    if len(row) > 14 and isinstance(row[14], list) and row[14]:
+        try:
+            label = row[14][0][0][1][1]
+        except (IndexError, TypeError):
+            logger.debug("Fare-name fallback path at row[14] failed shape match")
+            label = None
+        if isinstance(label, str) and label:
+            return label
+    return None

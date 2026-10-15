@@ -17,7 +17,7 @@ SAMPLE = Path(__file__).resolve().parent.parent / "explore_flight_details_sample
 
 
 def _wrb_payloads(raw_bytes: bytes) -> list[list]:
-    """Walk the streaming body and return decoded ``wrb.fr`` inner payloads.
+    r"""Walk the streaming body and return decoded ``wrb.fr`` inner payloads.
 
     Body format: ``)]}'`` anti-XSSI prefix, then alternating ``<byte_size>\\n``
     headers and JSON frames. We don't rely on the size headers (some captures
@@ -35,7 +35,7 @@ def _wrb_payloads(raw_bytes: bytes) -> list[list]:
     pos = 0
     while pos < len(text):
         # Skip whitespace and any digit-only "size header" lines between frames.
-        while pos < len(text) and not text[pos] in "[{":
+        while pos < len(text) and text[pos] not in "[{":
             pos += 1
         if pos >= len(text):
             break

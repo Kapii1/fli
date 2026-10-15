@@ -1,40 +1,337 @@
-"""HTTP client for Google Flights endpoints.
+"""HTTP client implementation with impersonation, rate limiting and retry functionality.
 
-Two client flavors:
+This module provides a robust HTTP client that handles:
 
-- :class:`Client` — general-purpose client for SearchFlights / SearchDates.
-  Rate-limited, retried, shared singleton.
-- :class:`FastClient` — HTTP/3 + DoH + chrome133a client for the Explore
-  endpoint, where a single hot request matters more than pooling. Build a
-  fresh instance per logical search: Google slow-serves (~20 s) any session
-  that has already issued a POST on this path.
+- User agent impersonation (to mimic a browser)
+- Rate limiting (10 requests per second, *globally* across threads)
+- Automatic retries with exponential backoff
+- Thread-safe session management (one ``curl_cffi`` session per worker thread)
+- Error handling
 
-Both share impersonation and header defaults.
+Threading model
+---------------
+
+``curl_cffi.requests.Session`` wraps a libcurl handle which is not safe
+to share across threads. We keep one session per worker thread using
+``threading.local``; the rate-limit budget is shared globally via
+:class:`~fli.search._concurrency.TokenBucketRateLimiter` so concurrent
+callers cooperate cleanly under Google's 10 req/sec ceiling.
 """
 
 from __future__ import annotations
 
+import os
+import threading
 import time as _time
 from queue import Empty as _QueueEmpty
 from queue import Queue as _Queue
 from threading import Lock as _Lock
 from threading import Thread as _Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from curl_cffi import CurlHttpVersion, CurlOpt, requests
-from ratelimit import limits, sleep_and_retry
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
-client = None
+from fli.search._concurrency import TokenBucketRateLimiter
+from fli.search.exceptions import (
+    SearchCertificateError,
+    SearchClientError,
+    SearchConnectionError,
+    SearchHTTPError,
+    SearchTimeoutError,
+)
 
-DEFAULT_HEADERS = {
+# ``curl_cffi`` adds ~100ms to import time on first load — we only need
+# it once an HTTP request actually fires, so import lazily on first use.
+# ``TYPE_CHECKING`` makes the annotation visible to static checkers
+# without paying the import cost at runtime.
+if TYPE_CHECKING:
+    from curl_cffi import requests as _curl_requests
+
+    Response = _curl_requests.Response
+    Session = _curl_requests.Session
+else:
+    Response = "Any"
+    Session = "Any"
+
+# Module-level singleton client + lock guarding its lazy initialisation.
+# ``get_client()`` uses double-checked locking so concurrent first callers
+# can't each construct an independent ``Client`` (each with its own
+# ``TokenBucketRateLimiter`` — that would silently double the global
+# request budget).
+client: Client | None = None
+_client_lock = threading.Lock()
+
+# Google's published ceiling.
+DEFAULT_CALLS_PER_SECOND = 10
+
+# Request timeout in seconds.  Override with the FLI_TIMEOUT env var.
+DEFAULT_TIMEOUT: float = 60.0
+_env_timeout = os.environ.get("FLI_TIMEOUT")
+if _env_timeout is not None:
+    try:
+        REQUEST_TIMEOUT: float = float(_env_timeout)
+    except ValueError:
+        msg = f"FLI_TIMEOUT must be a number of seconds, got: {_env_timeout!r}"
+        raise ValueError(msg) from None
+    if REQUEST_TIMEOUT <= 0:
+        raise ValueError(f"FLI_TIMEOUT must be a positive number, got: {_env_timeout!r}")
+else:
+    REQUEST_TIMEOUT = DEFAULT_TIMEOUT
+
+# EU/EEA IPs are redirected to Google's consent interstitial, which serves a
+# page with no ds:1 payload — every search then fails to parse. A pre-accepted
+# SOCS cookie skips the interstitial (the legacy CONSENT cookie no longer
+# works, and a truncated SOCS value is ignored). Override with FLI_SOCS_COOKIE
+# if Google rotates the value; set it empty to send no cookie at all.
+DEFAULT_SOCS_COOKIE = (
+    "CAISNQgQEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwMzE3LjA5X3AwGgJlbiADGgYIgLC_rwY"
+)
+SOCS_COOKIE = os.environ.get("FLI_SOCS_COOKIE", DEFAULT_SOCS_COOKIE)
+
+# A TLS-intercepting corporate proxy re-signs Google's certificate with a
+# private CA that curl's bundled trust store doesn't know about, so every
+# request fails verification. Checked in this order: FLI_CA_BUNDLE (this
+# client's own override) first, then CURL_CA_BUNDLE and REQUESTS_CA_BUNDLE —
+# the conventions curl and python-requests already use — so a developer who
+# has one of those set for other tools does not have to duplicate it, while
+# an explicit FLI_-prefixed value always wins.
+_CA_BUNDLE_ENV_VARS = ("FLI_CA_BUNDLE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+
+
+def _ca_bundle_from_env() -> str | None:
+    """Return the first configured CA bundle path from the supported env vars.
+
+    A configured path that is not a readable file raises
+    :class:`SearchCertificateError` naming both the variable and the path —
+    almost always a typo or a bundle that hasn't been mounted into a
+    container yet, and worth failing on immediately with a clear message
+    rather than surfacing later as a confusing curl error.
+
+    Called once per thread, from ``Client._session()`` when that thread's
+    session is first created — see its docstring for the caching
+    consequence (changing the env var afterwards does not affect an
+    already-created session).
+    """
+    for name in _CA_BUNDLE_ENV_VARS:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        if not os.path.isfile(value) or not os.access(value, os.R_OK):
+            raise SearchCertificateError(
+                f"{name} points to a CA bundle path that does not exist or "
+                f"is not readable: {value!r}"
+            )
+        return value
+    return None
+
+
+class Client:
+    """HTTP client with built-in rate limiting, retry and user agent impersonation functionality.
+
+    Sessions are kept per-thread because ``curl_cffi.requests.Session`` is
+    not thread-safe — concurrent ``post``/``get`` calls from different
+    threads each get their own libcurl handle. The shared
+    :class:`TokenBucketRateLimiter` enforces the global 10 req/sec budget
+    across all of them.
+    """
+
+    DEFAULT_HEADERS = {
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+    }
+
+    def __init__(
+        self,
+        calls_per_second: int = DEFAULT_CALLS_PER_SECOND,
+    ):
+        """Initialise the shared rate limiter and per-thread session storage."""
+        self._sessions = threading.local()
+        self._rate_limiter = TokenBucketRateLimiter(calls=calls_per_second, period=1.0)
+
+    def _session(self) -> Session:
+        """Return this thread's ``Session``, creating it on first use.
+
+        The CA-bundle env vars (see ``_ca_bundle_from_env``) and
+        ``SOCS_COOKIE`` are only read the first time *this thread* needs a
+        session — once created, a thread's session is cached for its
+        lifetime (and the module-level singleton in ``get_client()``
+        extends that across the whole process). Changing ``FLI_CA_BUNDLE``
+        (or the other two) after a session already exists has no effect on
+        it; only a new thread, or a fresh ``Client()``, picks up the
+        change.
+        """
+        session = getattr(self._sessions, "session", None)
+        if session is None:
+            # Deferred import: ``curl_cffi`` is heavy (~100ms cold) and
+            # not needed for CLI flows that never hit the network, so
+            # only pull it in on the first real request.
+            from curl_cffi import requests as _requests
+
+            session = _requests.Session()
+            session.headers.update(self.DEFAULT_HEADERS)
+            if SOCS_COOKIE:
+                session.cookies.set("SOCS", SOCS_COOKIE, domain=".google.com")
+            ca_bundle = _ca_bundle_from_env()
+            if ca_bundle:
+                session.verify = ca_bundle
+            self._sessions.session = session
+        return session
+
+    def __del__(self):
+        """Best-effort cleanup of the main-thread session (others die with their thread)."""
+        session = getattr(self._sessions, "session", None) if hasattr(self, "_sessions") else None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 — destruction-time best effort
+                pass
+
+    # ------------------------------------------------------------------
+    # Request entry points
+    # ------------------------------------------------------------------
+
+    # A bad CA bundle path or an untrusted certificate is deterministic for
+    # a fixed environment — retrying the identical request three times with
+    # backoff before the user ever sees the actionable message just wastes
+    # their time, so SearchCertificateError is the one failure mode this
+    # decorator does not retry. retry_if_not_exception_type() sees the
+    # *wrapped* type here, not the raw curl exception: `except Exception`
+    # below always re-raises via `_wrap_request_error(...)` before this
+    # decorator's predicate ever runs.
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(),
+        retry=retry_if_not_exception_type(SearchCertificateError),
+        reraise=True,
+    )
+    def get(self, url: str, **kwargs: Any) -> Response:
+        """Make a rate-limited GET request with automatic retries."""
+        self._rate_limiter.acquire()
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        try:
+            response = self._session().get(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            raise _wrap_request_error("GET", url, e) from e
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(),
+        retry=retry_if_not_exception_type(SearchCertificateError),
+        reraise=True,
+    )
+    def post(self, url: str, **kwargs: Any) -> Response:
+        """Make a rate-limited POST request with automatic retries."""
+        self._rate_limiter.acquire()
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        try:
+            response = self._session().post(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            raise _wrap_request_error("POST", url, e) from e
+
+
+# libcurl's CURLE_PEER_FAILED_VERIFICATION code. curl_cffi's own
+# ``code2error`` dispatch maps this 1:1 to ``CertificateVerifyError`` on
+# both 0.15.0 and 0.16.3 (exceptions.py's CODE2ERROR table has no other
+# entry for it in either version), so the isinstance() check below is
+# normally enough on its own — see is_untyped_certificate_error in
+# _wrap_request_error for what this constant backs and why it's kept
+# despite being unreachable on those two versions.
+_CURLE_PEER_FAILED_VERIFICATION = 60
+
+
+def _wrap_request_error(method: str, url: str, exc: BaseException) -> SearchClientError:
+    """Map curl-cffi / network errors into our typed ``SearchClientError`` family.
+
+    The CLI surfaces these as short user-facing messages and writes the
+    underlying traceback to a log file, so the message here should read
+    well on its own.
+    """
+    # If a typed error somehow escapes the request body (e.g. a future
+    # change in ``_session()``), keep its original type instead of
+    # downgrading it to the generic fallback below.
+    if isinstance(exc, SearchClientError):
+        return exc
+
+    # Imported lazily — ``curl_cffi.requests.exceptions`` triggers the
+    # full curl-cffi load, which we otherwise defer until first request.
+    from curl_cffi.requests import exceptions as curl_exc
+
+    host = _host_from_url(url)
+
+    # ``CertificateVerifyError`` is itself an ``SSLError`` -> ``ConnectionError``
+    # subclass, so this must run before the generic ``curl_exc.ConnectionError``
+    # branch below or a bad certificate would silently read as a vague "check
+    # your connection" message instead of naming the fix. Two independent
+    # forward-compat guards, kept as separate named conditions since they
+    # guard against different future breakages:
+    #
+    # - is_typed_certificate_error: the normal case today. ``getattr(...,
+    #   ())`` keeps this safe if a future curl_cffi release ever drops the
+    #   class entirely — ``isinstance(exc, ())`` is simply always False.
+    # - is_untyped_certificate_error: belt-and-suspenders for a future
+    #   release that raises the plain ``SSLError``/``ConnectionError`` base
+    #   class with the same code instead of the ``CertificateVerifyError``
+    #   subclass (see ``_CURLE_PEER_FAILED_VERIFICATION`` above — confirmed
+    #   unreachable on curl_cffi 0.15.0/0.16.3, kept anyway).
+    certificate_error_cls = getattr(curl_exc, "CertificateVerifyError", ())
+    is_typed_certificate_error = certificate_error_cls and isinstance(exc, certificate_error_cls)
+    is_untyped_certificate_error = (
+        isinstance(exc, curl_exc.ConnectionError)
+        and getattr(exc, "code", None) == _CURLE_PEER_FAILED_VERIFICATION
+    )
+    if is_typed_certificate_error or is_untyped_certificate_error:
+        env_vars = ", ".join(_CA_BUNDLE_ENV_VARS)
+        return SearchCertificateError(
+            f"TLS certificate verification failed for Google Flights ({host}). "
+            f"If your network uses a custom certificate authority (e.g. a "
+            f"TLS-intercepting corporate proxy), set one of {env_vars} to a "
+            f"CA bundle path and try again."
+        )
+    if isinstance(exc, curl_exc.Timeout):
+        return SearchTimeoutError(
+            f"Timed out talking to Google Flights ({host}). "
+            "The service may be slow or unreachable from your network — "
+            "check your connection and try again."
+        )
+    if isinstance(exc, curl_exc.ConnectionError):
+        return SearchConnectionError(
+            f"Could not reach Google Flights ({host}). "
+            "Check your internet connection or DNS and try again."
+        )
+    if isinstance(exc, curl_exc.HTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        suffix = f" (HTTP {status})" if status else ""
+        return SearchHTTPError(
+            f"Google Flights returned an error response{suffix}. "
+            "The request may be malformed, rate-limited, or blocked.",
+            status_code=status,
+        )
+    # Anything else (including bare CurlError) — keep a clean message but
+    # preserve the original via ``__cause__`` so logs still show details.
+    return SearchClientError(
+        f"{method} request to Google Flights ({host}) failed: {exc.__class__.__name__}"
+    )
+
+
+def _host_from_url(url: str) -> str:
+    """Best-effort host extraction for error messages."""
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url).hostname or url
+    except Exception:  # noqa: BLE001 — never let logging fail the request path
+        return url
+
+
+# --- FastClient support (HTTP/3 + DoH + chrome133a), used by the Explore path ---
+IMPERSONATE = "chrome133a"
+FAST_DEFAULT_HEADERS = {
     "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
 }
-
-# curl_cffi impersonation profile. chrome133a matches the JA3/JA4 Google
-# currently expects from Chrome 133; older `chrome` profiles can trigger
-# anti-abuse slow-serve.
-IMPERSONATE = "chrome133a"
 
 
 class _GoogleResolver:
@@ -101,66 +398,10 @@ def _make_resolved_session(ip_index: int = 0) -> requests.Session:
         impersonate=IMPERSONATE,
         curl_options={CurlOpt.RESOLVE: [resolve_entry]},
     )
-    sess.headers.update(DEFAULT_HEADERS)
+    if SOCS_COOKIE:
+        sess.cookies.set("SOCS", SOCS_COOKIE, domain=".google.com")
+    sess.headers.update(FAST_DEFAULT_HEADERS)
     return sess
-
-
-class Client:
-    """Rate-limited HTTP client with impersonation and retries.
-
-    Suitable for SearchFlights and SearchDates. Uses chrome133a impersonation,
-    a shared session for connection reuse, and a 10 req/sec cap. Does NOT force
-    HTTP/3 — use :class:`FastClient` if you need h3 + DoH (e.g. for Explore).
-    """
-
-    DEFAULT_HEADERS = DEFAULT_HEADERS
-    REQUEST_TIMEOUT = 10
-
-    def __init__(self):
-        """Initialize a new client session with default headers."""
-        self._client = requests.Session(impersonate=IMPERSONATE)
-        self._client.headers.update(self.DEFAULT_HEADERS)
-        try:
-            # Full GET (not HEAD) so Google's Set-Cookie headers for NID et al.
-            # are returned — HEAD responses sometimes omit them.
-            self._client.get(
-                "https://www.google.com/travel/flights",
-                timeout=5,
-                allow_redirects=True,
-            )
-        except Exception:
-            pass
-
-    def __del__(self):
-        """Clean up client session on deletion."""
-        if hasattr(self, "_client"):
-            self._client.close()
-
-    @sleep_and_retry
-    @limits(calls=10, period=1)
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=4), reraise=True)
-    def get(self, url: str, **kwargs: Any) -> requests.Response:
-        """Make a rate-limited GET request with automatic retries."""
-        kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
-        try:
-            response = self._client.get(url, **kwargs)
-            response.raise_for_status()
-            return response
-        except Exception as e:
-            raise Exception(f"GET request failed: {str(e)}") from e
-
-    @sleep_and_retry
-    @limits(calls=10, period=1)
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=4), reraise=True)
-    def post(self, url: str, **kwargs: Any) -> requests.Response:
-        """Make a rate-limited POST request with automatic retries."""
-        kwargs.setdefault("timeout", self.REQUEST_TIMEOUT)
-        try:
-            response = self._client.post(url, **kwargs)
-            response.raise_for_status()
-            return response
-        except Exception as e:
-            raise Exception(f"POST request failed: {str(e)}") from e
 
 
 class FastClient:
@@ -340,16 +581,28 @@ class FastClient:
 
 
 def get_client() -> Client:
-    """Get or create the shared :class:`Client` singleton."""
+    """Get or create a shared HTTP client instance.
+
+    Returns:
+        Singleton instance of the HTTP client
+
+    """
+    # Double-checked locking: the fast path is a single read (no lock
+    # taken once the client is initialised). Only the first concurrent
+    # callers serialise through ``_client_lock`` to ensure exactly one
+    # ``Client`` (and therefore one ``TokenBucketRateLimiter``) ever
+    # exists per process.
     global client
-    if not client:
-        client = Client()
+    if client is None:
+        with _client_lock:
+            if client is None:
+                client = Client()
     return client
 
 
 def get_fast_client() -> FastClient:
     """Build a fresh :class:`FastClient`.
 
-    Not a singleton by design — Explore requires a per-search session.
+    Not a singleton by design: Explore requires a per-search session.
     """
     return FastClient()

@@ -4,18 +4,64 @@ This module provides parsing functions used by both the CLI and MCP interfaces
 to convert user input into domain model objects.
 """
 
+import csv
+import importlib.resources
+import re
 from enum import Enum
 from typing import TypeVar
 
-from fli.models import Airline, Airport, EmissionsFilter, MaxStops, SeatType, SortBy
+from fli.models import (
+    Airline,
+    Airport,
+    Alliance,
+    Currency,
+    EmissionsFilter,
+    MaxStops,
+    SeatType,
+    SortBy,
+)
+
+_AIRLINE_SEPARATORS = re.compile(r"[,\s]+")
 
 T = TypeVar("T", bound=Enum)
+_icao_to_iata: dict[str, str] | None = None
 
 
 class ParseError(ValueError):
     """Error raised when parsing fails."""
 
     pass
+
+
+def _load_icao_mapping() -> dict[str, str]:
+    """Load ICAO-to-IATA airport mappings lazily."""
+    global _icao_to_iata
+
+    if _icao_to_iata is None:
+        ref = importlib.resources.files("fli") / "data" / "icao_to_iata.csv"
+        with importlib.resources.as_file(ref) as p:
+            with open(p, newline="") as f:
+                reader = csv.reader(f)
+                _icao_to_iata = {icao.upper(): iata.upper() for icao, iata in reader}
+
+    return _icao_to_iata
+
+
+def icao_to_iata(code: str) -> str | None:
+    """Translate a 4-letter ICAO airport code to its IATA code.
+
+    Args:
+        code: Candidate ICAO code (case-insensitive), e.g. ``"KJFK"``.
+
+    Returns:
+        The IATA code (e.g. ``"JFK"``), or ``None`` if ``code`` is not a known
+        ICAO code.
+
+    """
+    normalized = code.strip().upper()
+    if len(normalized) != 4 or not normalized.isalpha():
+        return None
+    return _load_icao_mapping().get(normalized)
 
 
 def resolve_enum(enum_cls: type[T], name: str) -> T:
@@ -45,7 +91,7 @@ def resolve_airport(code: str) -> Airport:
     """Resolve an airport code to an Airport enum.
 
     Args:
-        code: IATA airport code (e.g., 'JFK', 'LHR')
+        code: IATA or ICAO airport code (e.g., 'JFK', 'LHR', 'KJFK', 'EGLL')
 
     Returns:
         The corresponding Airport enum member
@@ -54,33 +100,78 @@ def resolve_airport(code: str) -> Airport:
         ParseError: If the code is not a valid airport
 
     """
+    airport_code = code.upper()
+
+    if len(airport_code) == 4 and airport_code.isalpha():
+        mapped = icao_to_iata(airport_code)
+        if mapped is None:
+            raise ParseError(
+                f"Unknown ICAO code: '{code}'. Not found in the ICAO-to-IATA mapping table."
+            )
+        airport_code = mapped
+
     try:
-        return getattr(Airport, code.upper())
+        return getattr(Airport, airport_code)
     except AttributeError as e:
         raise ParseError(f"Invalid airport code: '{code}'") from e
+
+
+def resolve_airports(codes: str) -> list[Airport]:
+    """Resolve one or more comma-separated airport codes.
+
+    Args:
+        codes: A single code or a comma-separated list (e.g. ``"JFK,LGA"``).
+            Blank entries from stray or doubled commas are ignored.
+
+    Returns:
+        The resolved airports, in the order given.
+
+    Raises:
+        ParseError: If any code is unknown, or no codes remain after
+            discarding blanks (e.g. ``","``).
+
+    """
+    airports = [resolve_airport(code.strip()) for code in codes.split(",") if code.strip()]
+    if not airports:
+        raise ParseError(f"No valid airport codes found in: '{codes}'")
+    return airports
 
 
 def parse_airlines(codes: list[str] | None) -> list[Airline] | None:
     """Parse a list of airline codes into Airline enums.
 
+    Each item may itself contain multiple codes separated by commas or whitespace,
+    so callers can pass either ``["BA", "KL"]`` (one code per item) or
+    ``["BA,KL"]`` / ``["BA KL"]`` (combined). This lets the CLI accept the
+    documented ``--airlines BA,KL`` and ``--airlines "BA KL"`` forms in addition
+    to the repeated-flag form Typer collects natively.
+
     Args:
-        codes: List of IATA airline codes (e.g., ['BA', 'KL'])
+        codes: List of IATA airline codes; entries may be combined with commas or
+            whitespace (e.g., ['BA', 'KL'] or ['BA,KL'] or ['BA KL']).
 
     Returns:
-        List of Airline enums, or None if input is empty
+        List of Airline enums, or None if ``codes`` is None or an empty list.
 
     Raises:
-        ParseError: If any code is not a valid airline
+        ParseError: If any code is not a valid airline, or if ``codes`` was
+            non-empty but contained no parsable codes (e.g., [","]).
 
     """
     if not codes:
         return None
 
+    expanded = [
+        token.strip().upper()
+        for item in codes
+        for token in _AIRLINE_SEPARATORS.split(item)
+        if token.strip()
+    ]
+    if not expanded:
+        raise ParseError(f"No valid airline codes found in: {codes!r}")
+
     airlines = []
-    for code in codes:
-        code = code.strip().upper()
-        if not code:
-            continue
+    for code in expanded:
         # Airline codes starting with a digit need an underscore prefix
         # to match the Airline enum member names (e.g., "3F" -> "_3F")
         enum_key = f"_{code}" if code[0].isdigit() else code
@@ -90,7 +181,48 @@ def parse_airlines(codes: list[str] | None) -> list[Airline] | None:
         except AttributeError as e:
             raise ParseError(f"Invalid airline code: '{code}'") from e
 
-    return airlines if airlines else None
+    return airlines
+
+
+def parse_alliances(codes: list[str] | None) -> list[Alliance] | None:
+    """Parse a list of alliance identifiers into :class:`Alliance` enums.
+
+    Each item may itself contain multiple comma- or whitespace-separated
+    values, so the CLI can accept ``--alliance ONEWORLD,SKYTEAM`` and
+    repeated ``--alliance ONEWORLD --alliance STAR_ALLIANCE`` equally.
+    Case-insensitive; ``"Star Alliance"`` and ``"star_alliance"`` both
+    resolve to :data:`Alliance.STAR_ALLIANCE`.
+
+    Args:
+        codes: List of alliance names (may be combined with commas/spaces).
+
+    Returns:
+        List of :class:`Alliance` enum values, or ``None`` for empty input.
+
+    Raises:
+        ParseError: If any token is not a recognised alliance name.
+
+    """
+    if not codes:
+        return None
+
+    expanded: list[str] = [
+        token.strip().upper().replace(" ", "_").replace("-", "_")
+        for item in codes
+        for token in _AIRLINE_SEPARATORS.split(item)
+        if token.strip()
+    ]
+    if not expanded:
+        raise ParseError(f"No valid alliance names found in: {codes!r}")
+
+    out: list[Alliance] = []
+    for name in expanded:
+        try:
+            out.append(Alliance[name])
+        except KeyError as e:
+            valid = ", ".join(a.name for a in Alliance)
+            raise ParseError(f"Invalid alliance: '{name}'. Valid values: {valid}") from e
+    return out
 
 
 def parse_max_stops(stops: str) -> MaxStops:
@@ -188,6 +320,35 @@ def parse_sort_by(sort_by: str) -> SortBy:
         raise ParseError(
             f"Invalid sort_by value: '{sort_by}'. Valid values: {', '.join(valid_values)}"
         ) from e
+
+
+def parse_currency(currency: str | None) -> str | None:
+    """Validate and normalize a currency code string.
+
+    Accepts any ISO 4217 code; emits a warning-free passthrough for codes
+    listed in :class:`fli.models.Currency`, and uppercases unknown but
+    syntactically-valid 3-letter codes for transparent passthrough.
+
+    Args:
+        currency: ISO 4217 currency code or None.
+
+    Returns:
+        Uppercased currency code, or None if ``currency`` is None/empty.
+
+    Raises:
+        ParseError: If the value is not a valid ISO 4217-style code.
+
+    """
+    if currency is None or currency == "":
+        return None
+    normalized = currency.strip().upper()
+    if len(normalized) != 3 or not normalized.isalpha():
+        raise ParseError(f"Invalid currency code: '{currency}'. Expected a 3-letter ISO 4217 code.")
+    # If recognised, prefer the Currency enum's canonical value.
+    try:
+        return Currency(normalized).value
+    except ValueError:
+        return normalized
 
 
 def parse_emissions(emissions: str) -> EmissionsFilter:

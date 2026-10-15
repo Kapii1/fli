@@ -88,7 +88,7 @@ def test_return_date_without_departure_date_fails():
 def test_invalid_airport_fails_cleanly():
     result = explore_fn(ExploreParams(origin="NOPE"))
     assert result["success"] is False
-    assert "airport" in result["error"].lower()
+    assert "not found" in result["error"].lower()
 
 
 def test_sort_by_price_puts_unpriced_destinations_last():

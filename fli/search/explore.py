@@ -328,9 +328,10 @@ class GetExploreDestinations:
             price_block = r1[0]
             pb_price = (
                 float(price_block[1])
-                if len(price_block) > 1 and isinstance(price_block[1], (int, float))
-                   and not isinstance(price_block[1], bool)
-                   and price_block[1] > 0
+                if len(price_block) > 1
+                and isinstance(price_block[1], (int, float))
+                and not isinstance(price_block[1], bool)
+                and price_block[1] > 0
                 else None
             )
             if pb_price is not None:
@@ -406,6 +407,7 @@ class SearchExploreDetails:
     }
 
     def __init__(self):
+        """Create the explore search with a fresh :class:`FastClient`."""
         self.client = get_fast_client()
 
     def search(

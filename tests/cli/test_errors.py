@@ -1,0 +1,346 @@
+"""Tests for the CLI error reporting helpers."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from fli.cli.errors import _write_log, json_error_payload, report_cli_error
+from fli.cli.main import app
+from fli.core.parsers import ParseError
+from fli.search.exceptions import (
+    SearchCertificateError,
+    SearchClientError,
+    SearchConnectionError,
+    SearchHTTPError,
+    SearchParseError,
+    SearchRejectedError,
+    SearchTimeoutError,
+    SearchUnsupportedError,
+)
+
+
+@pytest.fixture
+def runner() -> CliRunner:
+    """Return a CliRunner instance."""
+    return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_tmp_log_dir(monkeypatch, tmp_path):
+    """Redirect _LOG_DIR so log files land under tmp_path instead of ~/.fli/logs/."""
+    monkeypatch.setattr("fli.cli.errors._LOG_DIR", tmp_path / "fli-logs")
+
+
+# The CLI invocations below pass fixed travel dates; pin the models' clock so
+# they stay in the future no matter when the suite runs.
+PINNED_TODAY = "2026-01-01"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_clock(pin_today):
+    """Freeze "today" well before every date literal in this module."""
+    pin_today(PINNED_TODAY)
+
+
+def test_write_log_creates_file_with_traceback(tmp_path):
+    """`_write_log` should write a file containing the traceback details."""
+    try:
+        raise SearchTimeoutError("backend slow")
+    except SearchTimeoutError as exc:
+        log_path = _write_log(exc, command="flights")
+
+    assert log_path.exists()
+    contents = log_path.read_text()
+    assert "command: flights" in contents
+    assert "SearchTimeoutError" in contents
+    assert "backend slow" in contents
+    assert "traceback:" in contents
+
+
+@pytest.mark.parametrize(
+    "exc, expected_type, expected_retryable",
+    [
+        # Released values (shipped before the shared classifier existed) —
+        # must stay exactly as they are; see fli/core/errors.py's
+        # vocabulary table.
+        (SearchTimeoutError("timed out"), "timeout", True),
+        (SearchConnectionError("dns"), "connection_error", True),
+        # Carried forward from PR #164: a SearchConnectionError
+        # subclass, but deterministic — not retryable, unlike its parent.
+        (SearchCertificateError("bad cert"), "certificate_error", False),
+        (SearchHTTPError("403", status_code=403), "http_error", False),
+        (SearchClientError("generic"), "search_error", False),
+        (RuntimeError("boom"), "unexpected_error", False),
+        # Gained from the shared fli.core.errors.classify_error classifier —
+        # the CLI didn't distinguish these from
+        # "search_error"/"unexpected_error" before.
+        (SearchRejectedError(13), "rejected_error", False),
+        (SearchUnsupportedError("multi-city"), "unsupported_error", False),
+        (SearchParseError("no ds:1 payload"), "parse_error", False),
+        (ParseError("unknown airport code 'ZZZ'"), "validation_error", False),
+        # These two used to hit the CLI commands' hand-rolled
+        # `except (AttributeError, ValueError)` block and get hardcoded
+        # "search_error". Routed through the shared classifier here now
+        # covers json_error_payload itself; the command files' own except
+        # blocks are covered in tests/cli/test_flights.py and
+        # tests/cli/test_dates.py.
+        (ValueError("bad date range"), "validation_error", False),
+        (AttributeError("'NoneType' object has no attribute 'name'"), "unexpected_error", False),
+    ],
+)
+def test_json_error_payload_maps_error_types(exc, expected_type, expected_retryable):
+    """Each exception class should map to the shared classifier's error_type string."""
+    payload = json_error_payload(exc)
+    assert payload.error_type == expected_type
+    assert payload.retryable is expected_retryable
+    assert isinstance(payload.log_path, Path)
+    assert payload.log_path.exists()
+    assert payload.message  # non-empty
+
+
+def test_json_error_payload_pydantic_validation_error_maps_to_validation_error():
+    """Pydantic's own ValidationError should classify as validation_error too."""
+    from pydantic import BaseModel, ValidationError
+
+    class _Model(BaseModel):
+        passengers: int
+
+    try:
+        _Model(passengers="not-a-number")
+    except ValidationError as exc:
+        payload = json_error_payload(exc)
+        assert payload.error_type == "validation_error"
+        assert payload.retryable is False
+
+
+def test_report_cli_error_returns_typer_exit_and_writes_log(tmp_path, capsys):
+    """`report_cli_error` should write a log and return a typer.Exit."""
+    import typer
+
+    exc = SearchTimeoutError("hung")
+    result = report_cli_error(exc, command="multi")
+    assert isinstance(result, typer.Exit)
+    assert result.exit_code == 1
+
+    # A log file should now exist under our redirected tmp dir.
+    log_files = list((tmp_path / "fli-logs").glob("fli-error-*.log"))
+    assert len(log_files) == 1
+
+
+def test_search_command_handles_timeout_cleanly(runner, monkeypatch, tmp_path):
+    """A curl timeout inside a search should produce a clean message + log file."""
+    from curl_cffi.requests import exceptions as curl_exc
+
+    def fake_request(self, url, **kwargs):
+        raise curl_exc.Timeout("curl: (28) timed out", 28, None)
+
+    # Search reads the public page over GET; booking calls still POST. Stub
+    # both so the test covers the failure wherever the request is made.
+    monkeypatch.setattr("curl_cffi.requests.Session.get", fake_request)
+    monkeypatch.setattr("curl_cffi.requests.Session.post", fake_request)
+
+    result = runner.invoke(app, ["flights", "SEA", "NRT", "2026-12-26"])
+
+    assert result.exit_code == 1
+    # Friendly message — no raw curl traceback in the output.
+    assert "Error" in result.output
+    assert "Timed out talking to Google Flights" in result.output
+    assert "Full traceback written to" in result.output
+    assert "Traceback (most recent call last)" not in result.output
+
+    log_files = list((tmp_path / "fli-logs").glob("fli-error-*.log"))
+    assert len(log_files) >= 1
+
+
+def test_multi_command_reports_unsupported(runner, tmp_path):
+    """Multi-city has no search-page transport — say so instead of pricing one leg."""
+    result = runner.invoke(
+        app,
+        [
+            "multi",
+            "-l",
+            "SEA,NRT,2026-12-26",
+            "-l",
+            "NRT,HKG,2026-12-30",
+            "-l",
+            "HKG,SEA,2027-01-05",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Multi-city search is not available" in result.output
+    assert "Traceback (most recent call last)" not in result.output
+
+
+@pytest.mark.parametrize(
+    "exc, expected_msg",
+    [
+        (SearchTimeoutError("slow"), "Request timed out. slow"),
+        (SearchCertificateError("bad cert"), "TLS certificate error. bad cert"),
+        (SearchConnectionError("dns"), "Network error. dns"),
+        (SearchHTTPError("403", status_code=403), "Google Flights error. 403"),
+        (SearchClientError("generic failure"), "Search failed. generic failure"),
+        (ValueError("bad input"), "Unexpected error: ValueError: bad input"),
+    ],
+)
+def test_friendly_message(exc, expected_msg):
+    """_friendly_message must dispatch to the correct user-facing message per error type."""
+    from fli.cli.errors import _friendly_message
+
+    assert _friendly_message(exc) == expected_msg
+
+
+class TestWriteLogDetails:
+    def test_no_command_omits_command_line(self):
+        try:
+            raise SearchTimeoutError("slow backend")
+        except SearchTimeoutError as exc:
+            log_path = _write_log(exc, command=None)
+        contents = log_path.read_text()
+        assert "command:" not in contents
+
+    def test_argv_written_to_log(self):
+        import sys
+
+        try:
+            raise SearchConnectionError("no route")
+        except SearchConnectionError as exc:
+            log_path = _write_log(exc)
+        contents = log_path.read_text()
+        assert "argv:" in contents
+        assert str(sys.argv) in contents
+
+    def test_qualified_error_type_in_log(self):
+        try:
+            raise SearchTimeoutError("timeout")
+        except SearchTimeoutError as exc:
+            log_path = _write_log(exc)
+        contents = log_path.read_text()
+        assert "fli.search.exceptions.SearchTimeoutError" in contents
+
+    def test_timestamp_present_in_log(self):
+        try:
+            raise SearchClientError("x")
+        except SearchClientError as exc:
+            log_path = _write_log(exc)
+        assert "timestamp:" in log_path.read_text()
+
+
+class TestJsonErrorPayloadMessages:
+    def test_message_is_str_of_exception(self):
+        exc = SearchTimeoutError("timed out waiting for response")
+        payload = json_error_payload(exc)
+        assert payload.message == str(exc) == "timed out waiting for response"
+
+    def test_unexpected_error_message_format(self):
+        exc = RuntimeError("bad input")
+        payload = json_error_payload(exc)
+        assert payload.message == "RuntimeError: bad input"
+        assert payload.error_type == "unexpected_error"
+
+    def test_log_path_is_a_real_file(self):
+        exc = SearchConnectionError("dns failure")
+        payload = json_error_payload(exc)
+        assert payload.log_path.exists()
+        assert payload.log_path.is_file()
+
+    def test_http_status_present_when_known(self):
+        exc = SearchHTTPError("rate limited", status_code=429)
+        payload = json_error_payload(exc)
+        assert payload.error_type == "http_error"
+        assert payload.retryable is True
+        assert payload.http_status == 429
+
+    def test_http_status_none_when_unknown(self):
+        exc = SearchHTTPError("mystery failure", status_code=None)
+        payload = json_error_payload(exc)
+        assert payload.http_status is None
+
+
+class TestReportCliErrorOptions:
+    def test_custom_exit_code_respected(self):
+        import typer
+
+        exc = SearchTimeoutError("hung")
+        result = report_cli_error(exc, exit_code=2)
+        assert isinstance(result, typer.Exit)
+        assert result.exit_code == 2
+
+
+def test_flights_command_json_error_includes_log_path(runner, monkeypatch, tmp_path):
+    """JSON-mode errors should include the log path and a typed error_type."""
+    import json
+
+    from curl_cffi.requests import exceptions as curl_exc
+
+    def fake_request(self, url, **kwargs):
+        raise curl_exc.ConnectionError("dns lookup failed", 6, None)
+
+    monkeypatch.setattr("curl_cffi.requests.Session.get", fake_request)
+    monkeypatch.setattr("curl_cffi.requests.Session.post", fake_request)
+
+    result = runner.invoke(
+        app,
+        ["flights", "JFK", "LHR", "2026-10-25", "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["success"] is False
+    assert payload["error"]["type"] == "connection_error"
+    assert payload["error"]["retryable"] is True
+    assert "log_path" in payload["error"]
+    assert Path(payload["error"]["log_path"]).exists()
+
+
+class TestTransportErrorClassification:
+    """`SearchParseError` used to surface as "Unexpected error" in the CLI.
+
+    It is raised on the normal flight path whenever Google serves a
+    consent/blocked page, so it needs to read as a search failure with a
+    useful hint, not as a crash.
+    """
+
+    def test_parse_error_is_a_search_client_error(self):
+        from fli.search import SearchParseError as exported
+        from fli.search.exceptions import SearchClientError as base
+        from fli.search.flights import SearchParseError as from_flights
+
+        assert exported is from_flights
+        assert issubclass(exported, base)
+
+    def test_parse_error_message_is_actionable(self):
+        from fli.cli.errors import _friendly_message
+        from fli.search import SearchParseError
+
+        message = _friendly_message(SearchParseError("Search page carried no ds:1 payload"))
+        assert "Unexpected error" not in message
+        assert "ds:1" in message
+        assert "FLI_SOCS_COOKIE" in message
+
+    def test_rejected_error_message_is_specific(self):
+        from fli.cli.errors import _friendly_message
+        from fli.search import SearchRejectedError
+
+        message = _friendly_message(SearchRejectedError(13))
+        assert "Unexpected error" not in message
+        assert "declined the request" in message
+
+    @pytest.mark.parametrize(
+        ("exc_factory", "expected_type"),
+        [
+            (lambda: __import__("fli.search", fromlist=["x"]).SearchParseError("x"), "parse_error"),
+            (
+                lambda: __import__("fli.search", fromlist=["x"]).SearchRejectedError(13),
+                "rejected_error",
+            ),
+        ],
+    )
+    def test_json_error_types(self, exc_factory, expected_type):
+        from fli.cli.errors import json_error_payload
+
+        payload = json_error_payload(exc_factory(), command="flights")
+        assert payload.error_type == expected_type

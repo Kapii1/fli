@@ -3,6 +3,17 @@ import pytest
 from fli.core.builders import build_date_search_segments, build_flight_segments, normalize_date
 from fli.models import Airport, TripType
 
+# The literal travel dates below are what these assertions are about, so pin
+# the models' clock instead of letting the module start failing the day those
+# dates fall into the past.
+PINNED_TODAY = "2026-01-01"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_clock(pin_today):
+    """Freeze "today" well before every date literal in this module."""
+    pin_today(PINNED_TODAY)
+
 
 class TestNormalizeDate:
     """Tests for normalize_date."""
@@ -73,3 +84,96 @@ class TestBuildDateSearchSegments:
         assert trip_type == TripType.ROUND_TRIP
         assert segments[0].travel_date == "2027-01-15"
         assert segments[1].travel_date == "2027-01-22"
+
+
+class TestBuildFlightSegmentsMultiAirport:
+    """Tests for multi-airport support in build_flight_segments."""
+
+    def test_single_airport_wraps_to_list(self):
+        segments, _ = build_flight_segments(
+            origin=Airport.JFK,
+            destination=Airport.LAX,
+            departure_date="2027-03-15",
+        )
+        assert segments[0].departure_airport == [[Airport.JFK, 0]]
+        assert segments[0].arrival_airport == [[Airport.LAX, 0]]
+
+    def test_list_of_origins(self):
+        segments, _ = build_flight_segments(
+            origin=[Airport.JFK, Airport.LGA],
+            destination=Airport.LHR,
+            departure_date="2027-03-15",
+        )
+        assert segments[0].departure_airport == [[Airport.JFK, 0], [Airport.LGA, 0]]
+        assert segments[0].arrival_airport == [[Airport.LHR, 0]]
+
+    def test_list_of_destinations(self):
+        segments, _ = build_flight_segments(
+            origin=Airport.JFK,
+            destination=[Airport.LHR, Airport.CDG],
+            departure_date="2027-03-15",
+        )
+        assert segments[0].departure_airport == [[Airport.JFK, 0]]
+        assert segments[0].arrival_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+
+    def test_lists_on_both_sides(self):
+        segments, _ = build_flight_segments(
+            origin=[Airport.JFK, Airport.LGA, Airport.EWR],
+            destination=[Airport.LHR, Airport.CDG],
+            departure_date="2027-03-15",
+        )
+        assert segments[0].departure_airport == [
+            [Airport.JFK, 0],
+            [Airport.LGA, 0],
+            [Airport.EWR, 0],
+        ]
+        assert segments[0].arrival_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+
+    def test_round_trip_mirrors_multi_airport(self):
+        segments, trip_type = build_flight_segments(
+            origin=[Airport.JFK, Airport.LGA],
+            destination=[Airport.LHR, Airport.CDG],
+            departure_date="2027-03-15",
+            return_date="2027-03-22",
+        )
+        assert trip_type == TripType.ROUND_TRIP
+        assert segments[0].departure_airport == [[Airport.JFK, 0], [Airport.LGA, 0]]
+        assert segments[0].arrival_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+        assert segments[1].departure_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+        assert segments[1].arrival_airport == [[Airport.JFK, 0], [Airport.LGA, 0]]
+
+
+class TestBuildDateSearchSegmentsMultiAirport:
+    """Tests for multi-airport support in build_date_search_segments."""
+
+    def test_single_airport_wraps_to_list(self):
+        segments, _ = build_date_search_segments(
+            origin=Airport.JFK,
+            destination=Airport.LAX,
+            start_date="2027-03-15",
+        )
+        assert segments[0].departure_airport == [[Airport.JFK, 0]]
+        assert segments[0].arrival_airport == [[Airport.LAX, 0]]
+
+    def test_list_inputs_preserved(self):
+        segments, _ = build_date_search_segments(
+            origin=[Airport.JFK, Airport.LGA],
+            destination=[Airport.LHR, Airport.CDG],
+            start_date="2027-03-15",
+        )
+        assert segments[0].departure_airport == [[Airport.JFK, 0], [Airport.LGA, 0]]
+        assert segments[0].arrival_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+
+    def test_round_trip_mirrors_multi_airport(self):
+        segments, trip_type = build_date_search_segments(
+            origin=[Airport.JFK, Airport.LGA],
+            destination=[Airport.LHR, Airport.CDG],
+            start_date="2027-03-15",
+            is_round_trip=True,
+            trip_duration=7,
+        )
+        assert trip_type == TripType.ROUND_TRIP
+        assert segments[0].departure_airport == [[Airport.JFK, 0], [Airport.LGA, 0]]
+        assert segments[0].arrival_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+        assert segments[1].departure_airport == [[Airport.LHR, 0], [Airport.CDG, 0]]
+        assert segments[1].arrival_airport == [[Airport.JFK, 0], [Airport.LGA, 0]]

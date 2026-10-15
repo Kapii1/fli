@@ -129,9 +129,41 @@ class ExploreSearchFilters(BaseModel):
         time_filter = self._time_restrictions()
         stops = self.stops.value
         if self.from_date is not None:
-            outbound = [origin, dest, time_filter, stops, None, None, self.from_date, None, None, None, None, None, None, None, 3]
+            outbound = [
+                origin,
+                dest,
+                time_filter,
+                stops,
+                None,
+                None,
+                self.from_date,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                3,
+            ]
             if self.trip_type == TripType.ROUND_TRIP:
-                return_seg = [dest, origin, time_filter, stops, None, None, self.to_date, None, None, None, None, None, None, None, 3]
+                return_seg = [
+                    dest,
+                    origin,
+                    time_filter,
+                    stops,
+                    None,
+                    None,
+                    self.to_date,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    3,
+                ]
                 return [outbound, return_seg]
             return [outbound]
         outbound = [origin, dest, time_filter, stops]
@@ -169,13 +201,9 @@ class ExploreSearchFilters(BaseModel):
 
     def format(self) -> list:
         """Serialize into the nested list structure sent to Google's API."""
-        date_range = (
-            [self.from_date, self.to_date] if self.from_date and self.to_date else None
-        )
+        date_range = [self.from_date, self.to_date] if self.from_date and self.to_date else None
         viewport = (
-            [list(self.viewport[0]), list(self.viewport[1])]
-            if self.viewport is not None
-            else None
+            [list(self.viewport[0]), list(self.viewport[1])] if self.viewport is not None else None
         )
         return [
             [],  # [0] known destinations filter (empty = any)
